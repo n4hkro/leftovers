@@ -1253,6 +1253,7 @@ class ProcmonAnalyzer:
         self,
         related_pids: Set[int],
         cancel_cb: Optional[Callable[[], bool]] = None,
+        progress_cb: Optional[Callable[[int, str], None]] = None,
     ) -> None:
         facts: Dict[str, Dict[str, object]] = {}
         family_facts: Dict[str, Dict[str, object]] = {}
@@ -1308,9 +1309,13 @@ class ProcmonAnalyzer:
                 else:
                     item["non_related_write_count"] = int(item["non_related_write_count"]) + 1
 
+        total_events = max(1, len(self.events))
         for idx, ev in enumerate(self.events, start=1):
             if cancel_cb and idx % 4000 == 0 and cancel_cb():
                 raise RuntimeError("İstifadəçi tərəfindən ləğv edildi.")
+            if progress_cb and idx % 5000 == 0:
+                progress_cb(min(99, int((idx / total_events) * 100)),
+                            f"Yol indeksi qurulur... {idx:,}/{total_events:,}")
             if not ev.path:
                 continue
             member_key = self._canonical_path(ev.path)
@@ -1478,6 +1483,9 @@ class ProcmonAnalyzer:
         if not root_terms:
             return []
 
+        if progress_cb:
+            progress_cb(1, "Terminlər genişləndirilir...")
+
         seed_patterns = compile_term_patterns(root_terms)
         dynamic_locations = self._discover_dynamic_terms(seed_patterns)
         exec_aliases = self._extract_execution_trace_aliases()
@@ -1485,12 +1493,18 @@ class ProcmonAnalyzer:
         pass1_patterns = compile_term_patterns(pass1_terms)
         related_pids, _, descendants_only, depth_by_pid = self.build_related_pid_set(pass1_patterns)
 
+        if progress_cb:
+            progress_cb(3, "Əlaqəli terminlər toplanır...")
+
         suggested_detail = self.collect_suggested_terms_detailed(related_pids, [], pass1_terms)
         chain_terms = [x["term"] for x in suggested_detail]
         pass2_terms = self._dedupe_terms(pass1_terms + chain_terms)
 
         final_patterns = compile_term_patterns(pass2_terms)
         related_pids, _, descendants_only, depth_by_pid = self.build_related_pid_set(final_patterns)
+
+        if progress_cb:
+            progress_cb(5, "Termin genişləndirilməsi tamamlanır...")
 
         pass3_suggested_detail = self.collect_suggested_terms_detailed(related_pids, [], pass2_terms)
         trusted_terms = [item["term"] for item in pass3_suggested_detail if item.get("trust_level") == "trusted"]
@@ -1501,12 +1515,22 @@ class ProcmonAnalyzer:
             final_patterns = merge_term_patterns(trusted_patterns, moderate_patterns)
             related_pids, _, descendants_only, depth_by_pid = self.build_related_pid_set(final_patterns)
 
+        if progress_cb:
+            progress_cb(7, "Yol mənbə indeksi qurulur...")
+
         session_start, session_end = self._build_session_time_window(related_pids)
-        self._build_path_provenance_index(related_pids, cancel_cb=cancel_cb)
+        self._build_path_provenance_index(
+            related_pids,
+            cancel_cb=cancel_cb,
+            progress_cb=lambda pct, txt: progress_cb(7 + min(7, int(pct * 8 / 100)), txt) if progress_cb else None,
+        )
 
         grouped: Dict[Tuple[str, str], List[ProcmonEvent]] = defaultdict(list)
         group_display_path: Dict[Tuple[str, str], str] = {}
         created_dirs_by_chain: Set[str] = set()
+
+        if progress_cb:
+            progress_cb(15, "Əlaqəli yollar müəyyən edilir...")
 
         related_parent_dirs: Set[str] = set()
         related_parent_reg: Set[str] = set()
@@ -1524,9 +1548,16 @@ class ProcmonAnalyzer:
                     if parent_dir:
                         related_parent_dirs.add(parent_dir)
 
+        if progress_cb:
+            progress_cb(16, "Hadisələr süzülür...")
+
+        total_events = max(1, len(self.events))
         for idx, ev in enumerate(self.events, start=1):
             if cancel_cb and idx % 2000 == 0 and cancel_cb():
                 raise RuntimeError("İstifadəçi tərəfindən ləğv edildi.")
+            if progress_cb and idx % 5000 == 0:
+                progress_cb(16 + min(23, int((idx / total_events) * 24)),
+                            f"Hadisələr süzülür... {idx:,}/{total_events:,}")
             if not ev.path or ev.operation not in INTERESTING_OPERATIONS:
                 continue
 
@@ -1553,15 +1584,23 @@ class ProcmonAnalyzer:
             grouped[canonical_key].append(ev)
             group_display_path.setdefault(canonical_key, ev.path)
 
+        if progress_cb:
+            progress_cb(40, "GUID əlaqələri yoxlanılır...")
+
         related_guids = self._collect_related_guids(related_pids)
         self._expand_grouped_with_guid_hits(grouped, related_guids, group_display_path=group_display_path, cancel_cb=cancel_cb)
 
+        if progress_cb:
+            progress_cb(42, f"Qruplar analiz olunur... (0/{len(grouped):,})")
+
         results: List[ResidueCandidate] = []
+        total_groups = max(1, len(grouped))
         for idx, (group_key, evs) in enumerate(grouped.items(), start=1):
             if cancel_cb and idx % 500 == 0 and cancel_cb():
                 raise RuntimeError("İstifadəçi tərəfindən ləğv edildi.")
             if progress_cb and idx % 200 == 0:
-                progress_cb(min(99, int((idx / max(1, len(grouped))) * 100)), f"Analiz: {idx:,}/{len(grouped):,} path")
+                progress_cb(42 + min(37, int((idx / total_groups) * 38)),
+                            f"Qruplar analiz olunur... {idx:,}/{total_groups:,}")
 
             path = group_display_path.get(group_key, evs[0].path if evs else group_key[1])
             lp = group_key[1]
@@ -1833,19 +1872,38 @@ class ProcmonAnalyzer:
             if raw_score >= 10:
                 results.append(candidate)
 
+        if progress_cb:
+            progress_cb(80, "Rename variantları yoxlanılır...")
         results = self._add_rename_dest_candidates(results)
+
+        if progress_cb:
+            progress_cb(82, "Ana qovluq namizədləri əlavə olunur...")
         results = self._add_parent_directory_candidates(results, created_dirs_by_chain)
+
+        if progress_cb:
+            progress_cb(84, "Vendor ailəsi yoxlanılır...")
         results = self._proactive_vendor_family_sweep(results)
+
+        if progress_cb:
+            progress_cb(86, "Təsdiqlənmiş köklərdən genişlənmə...")
         results = self._flood_fill_from_confirmed_roots(results, created_dirs_by_chain)
+
+        if progress_cb:
+            progress_cb(90, "Fayl metadata-sı yoxlanılır...")
         if enrich_file_metadata:
             self._enrich_candidates_with_file_metadata(results, final_patterns)
 
+        if progress_cb:
+            progress_cb(95, "Klasterlər təyin olunur...")
         # Installer/family IDs must be assigned before cluster bonus.
         self._assign_installer_clusters(results)
         self._assign_family_clusters(results)
         self._apply_cluster_bonus(results)
         results = self._merge_by_mapped_path(results)
         self._assign_removal_layers(results)
+
+        if progress_cb:
+            progress_cb(99, "Nəticələr sıralanır...")
         results.sort(key=lambda x: (x.raw_score, x.exists_now is True), reverse=True)
         return results
 
@@ -3180,19 +3238,19 @@ class AnalysisWorker(QObject):
             self.progress.emit(1, "CSV yüklənir...")
             events = ProcmonCsvLoader.load_csv(
                 self.csv_path,
-                progress_cb=lambda pct, txt: self._emit_phased(0, 50, pct, txt),
+                progress_cb=lambda pct, txt: self._emit_phased(0, 40, pct, txt),
                 cancel_cb=self.is_cancelled,
             )
             if self.is_cancelled():
                 self.failed.emit("İstifadəçi tərəfindən ləğv edildi.")
                 return
-            self.progress.emit(50, "CSV oxundu")
+            self.progress.emit(40, "CSV oxundu")
 
-            self.progress.emit(51, "Analiz üçün indekslər hazırlanır...")
+            self.progress.emit(41, "Analiz üçün indekslər hazırlanır...")
             analyzer = ProcmonAnalyzer(
                 events,
                 cancel_cb=self.is_cancelled,
-                progress_cb=lambda pct, txt: self._emit_phased(50, 75, pct, txt),
+                progress_cb=lambda pct, txt: self._emit_phased(41, 55, pct, txt),
             )
             if self.is_cancelled():
                 self.failed.emit("İstifadəçi tərəfindən ləğv edildi.")
@@ -3205,12 +3263,14 @@ class AnalysisWorker(QObject):
                 self.failed.emit("İstifadəçi tərəfindən ləğv edildi.")
                 return
 
-            self.progress.emit(76, f"İzlər analiz olunur: {', '.join(root_terms)}")
+            self.progress.emit(56, f"İzlər analiz olunur: {', '.join(root_terms)}")
             residues = analyzer.analyze_residue(
                 root_terms=root_terms,
                 cancel_cb=self.is_cancelled,
-                progress_cb=lambda pct, txt: self._emit_phased(75, 100, pct, txt),
+                progress_cb=lambda pct, txt: self._emit_phased(56, 95, pct, txt),
             )
+
+            self.progress.emit(96, "Nəticələr filtr olunur...")
             weak_min_score = max(10, self.min_score - 30)
             strong_residues: List[ResidueCandidate] = []
             weak_residues: List[ResidueCandidate] = []
@@ -3255,6 +3315,8 @@ class AnalysisWorker(QObject):
                 if weak_min_score <= residue.raw_score < self.min_score:
                     weak_residues.append(residue)
             residues = strong_residues
+
+            self.progress.emit(97, "Tövsiyə olunan terminlər toplanır...")
             term_patterns = compile_term_patterns(root_terms)
             related_pids, _, _, _ = analyzer.build_related_pid_set(term_patterns)
             suggested_terms = analyzer.collect_suggested_terms(related_pids, residues, root_terms)
@@ -3262,6 +3324,7 @@ class AnalysisWorker(QObject):
                 self.failed.emit("İstifadəçi tərəfindən ləğv edildi.")
                 return
 
+            self.progress.emit(99, "Nəticələr hazırlanır...")
             payload = {
                 "selected_terms": root_terms,
                 "suggested_terms": suggested_terms,
