@@ -4,6 +4,12 @@ import csv
 import os
 from typing import Callable, Dict, List, Optional, Tuple
 
+try:
+    import duckdb as _duckdb
+    _DUCKDB_AVAILABLE = True
+except ImportError:
+    _DUCKDB_AVAILABLE = False
+
 from leftovers.constants.operations import AVG_CSV_LINE_BYTES, INTERESTING_OPERATIONS
 from leftovers.models.event import ProcmonEvent
 from leftovers.utils.path import normalize_path
@@ -34,6 +40,13 @@ _FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "Command Line": ("Command Line",),
 }
 
+# DuckDB encoding name map (Python → DuckDB)
+_DUCK_ENC: Dict[str, str] = {
+    "utf-8-sig": "UTF-8",
+    "utf-8": "UTF-8",
+    "utf-16": "UTF-16",
+}
+
 
 def _build_column_index(
     headers: List[str],
@@ -62,6 +75,159 @@ class ProcmonCsvLoader:
 
     @classmethod
     def load_csv(
+        cls,
+        csv_path: str,
+        progress_cb: Optional[Callable[[int, str], None]] = None,
+        cancel_cb: Optional[Callable[[], bool]] = None,
+    ) -> List[ProcmonEvent]:
+        if _DUCKDB_AVAILABLE:
+            return cls._load_csv_duckdb(csv_path, progress_cb=progress_cb, cancel_cb=cancel_cb)
+        return cls._load_csv_python(csv_path, progress_cb=progress_cb, cancel_cb=cancel_cb)
+
+    # ------------------------------------------------------------------ #
+    # DuckDB-based loader (primary path when duckdb is installed)          #
+    # ------------------------------------------------------------------ #
+
+    @classmethod
+    def _load_csv_duckdb(
+        cls,
+        csv_path: str,
+        progress_cb: Optional[Callable[[int, str], None]] = None,
+        cancel_cb: Optional[Callable[[], bool]] = None,
+    ) -> List[ProcmonEvent]:
+        """Load CSV via DuckDB.
+
+        DuckDB's multi-threaded C++ CSV parser is significantly faster than
+        Python's csv module on large files, and the WHERE pushdown means only
+        rows with interesting operations are transferred back to Python.
+        Falls back to the pure-Python loader if DuckDB raises an exception.
+        """
+        try:
+            return cls._load_csv_duckdb_impl(csv_path, progress_cb=progress_cb, cancel_cb=cancel_cb)
+        except RuntimeError:
+            # Re-raise cancellation errors without falling back.
+            raise
+        except Exception:
+            return cls._load_csv_python(csv_path, progress_cb=progress_cb, cancel_cb=cancel_cb)
+
+    @classmethod
+    def _load_csv_duckdb_impl(
+        cls,
+        csv_path: str,
+        progress_cb: Optional[Callable[[int, str], None]] = None,
+        cancel_cb: Optional[Callable[[], bool]] = None,
+    ) -> List[ProcmonEvent]:
+        encoding = _detect_encoding(csv_path)
+        duck_enc = _DUCK_ENC.get(encoding.lower(), "UTF-8")
+
+        # Escape single quotes in the path for SQL safety.
+        escaped_path = csv_path.replace("\\", "\\\\").replace("'", "''")
+
+        conn = _duckdb.connect(":memory:")
+        try:
+            # ── Read one row to discover column names ──
+            sample_rel = conn.execute(
+                f"SELECT * FROM read_csv('{escaped_path}', header=true,"
+                f" encoding='{duck_enc}', sample_size=1, ignore_errors=true)"
+            )
+            headers = [desc[0] for desc in sample_rel.description]
+
+            # Validate required columns
+            header_set = set(headers)
+            missing = [
+                canonical
+                for canonical, aliases in cls.REQUIRED_FIELD_ALIASES.items()
+                if not any(alias in header_set for alias in aliases)
+            ]
+            if missing:
+                raise ValueError(f"CSV-də lazımi sütunlar yoxdur: {', '.join(sorted(missing))}")
+
+            col = _build_column_index(headers)
+
+            # Find the actual Operation column name in the CSV header.
+            op_col_name = next(
+                (a for a in _FIELD_ALIASES["Operation"] if a in header_set), None
+            )
+            if op_col_name is None:
+                raise ValueError("CSV-də 'Operation' sütunu yoxdur")
+
+            # Build the IN-list for the WHERE clause.
+            ops_sql = ", ".join(f"'{op}'" for op in INTERESTING_OPERATIONS)
+            quoted_op_col = op_col_name.replace('"', '""')
+
+            if progress_cb:
+                progress_cb(5, "DuckDB ilə CSV oxunur...")
+
+            if cancel_cb and cancel_cb():
+                raise RuntimeError("İstifadəçi tərəfindən ləğv edildi.")
+
+            # ── Main read: filter interesting ops in SQL (C++ fast path) ──
+            rows = conn.execute(
+                f'SELECT * FROM read_csv('
+                f"'{escaped_path}', header=true, encoding='{duck_enc}',"
+                f" all_varchar=true, ignore_errors=true, null_padding=true)"
+                f' WHERE "{quoted_op_col}" IN ({ops_sql})'
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if progress_cb:
+            progress_cb(85, f"ProcmonEvent obyektləri yaradılır: {len(rows):,}")
+
+        if cancel_cb and cancel_cb():
+            raise RuntimeError("İstifadəçi tərəfindən ləğv edildi.")
+
+        # Pre-resolve column indices (same sentinel convention as Python loader).
+        _i_time = col.get("Time of Day", -1)
+        _i_proc = col.get("Process Name", -1)
+        _i_pid = col.get("PID", -1)
+        _i_op = col.get("Operation", -1)
+        _i_path = col.get("Path", -1)
+        _i_result = col.get("Result", -1)
+        _i_detail = col.get("Detail", -1)
+        _i_ppid = col.get("Parent PID", -1)
+        _i_ppath = col.get("Process Path", -1)
+        _i_cmdline = col.get("Command Line", -1)
+
+        _norm_sp = normalize_spaces
+        _norm_path = normalize_path
+        _safe_int = safe_int
+        _Event = ProcmonEvent
+
+        def _get(row: tuple, idx: int) -> str:
+            if idx < 0 or idx >= len(row):
+                return ""
+            v = row[idx]
+            return "" if v is None else str(v)
+
+        events: List[ProcmonEvent] = []
+        _append = events.append
+        for row in rows:
+            if cancel_cb and len(events) % 5000 == 0 and cancel_cb():
+                raise RuntimeError("İstifadəçi tərəfindən ləğv edildi.")
+            _append(_Event(
+                time_of_day=_norm_sp(_get(row, _i_time)),
+                process_name=_norm_sp(_get(row, _i_proc)),
+                pid=_safe_int(_get(row, _i_pid)),
+                operation=op,
+                path=_norm_path(_get(row, _i_path)),
+                result=_norm_sp(_get(row, _i_result)),
+                detail=_norm_sp(_get(row, _i_detail)),
+                parent_pid=_safe_int(_get(row, _i_ppid)),
+                process_path=_norm_path(_get(row, _i_ppath)),
+                command_line=_norm_sp(_get(row, _i_cmdline)),
+            ))
+
+        if progress_cb:
+            progress_cb(100, f"CSV yükləndi: {len(events):,} sətir")
+        return events
+
+    # ------------------------------------------------------------------ #
+    # Pure-Python fallback loader                                          #
+    # ------------------------------------------------------------------ #
+
+    @classmethod
+    def _load_csv_python(
         cls,
         csv_path: str,
         progress_cb: Optional[Callable[[int, str], None]] = None,
