@@ -1345,6 +1345,64 @@ class ProcmonAnalyzer:
         progress_cb: Optional[Callable[[int, str], None]] = None,
         cancel_cb: Optional[Callable[[], bool]] = None,
     ) -> List[ResidueCandidate]:
+        """Iterative flood-fill expansion from high-confidence root candidates.
+
+        Starting from already-scored candidates, this method repeatedly
+        expands the result set by discovering related artifacts that were not
+        captured during the initial scoring pass.  It runs up to
+        *max_iterations* rounds (default **3**), each consisting of five
+        ordered sub-steps:
+
+        **Addım 1 – Kök klaster genişlənməsi** (*Root cluster expansion*)
+            High-confidence roots (raw_score ≥ 80) are used as seeds.
+            Candidates that share a family ID (vendor, service, rename, or
+            installer cluster) with a seed receive a +20 score boost.  This
+            propagates confidence through logically related artifacts.
+            See :meth:`_expand_confirmed_root_clusters`.
+
+        **Addım 2 – Fayl sistemi və registr qonşuluğu** (*FS & registry
+        neighbourhood*)
+            For every confirmed residue (score ≥ 55) that still exists on
+            disk, the parent directory is walked (up to depth 4) and
+            neighbouring registry keys are discovered via binary-search.
+            New items inherit ~50 % of the parent's score.
+            See :meth:`_expand_fs_and_registry`.
+
+        **Addım 3 – Registr budaq taraması** (*Registry branch sweep*)
+            Registry-type residues (score ≥ 50) have their full branch
+            enumerated so that sub-keys and values are included in the
+            result set.
+            See :meth:`_expand_confirmed_registry_branches`.
+
+        **Addım 4 – Qardaş fayllar** (*Sibling files*)
+            Files sharing the same base name (different extension) or
+            registry keys sharing the same parent are added.
+            See :meth:`_expand_siblings`.
+
+        **Addım 5 – Ana qovluqlar** (*Parent directories*)
+            If a confirmed residue's parent directory was originally created
+            during the traced session, it is added as a directory candidate.
+            See :meth:`_add_parent_directory_candidates`.
+
+        The loop terminates early when an iteration adds **no new
+        candidates**, meaning the expansion has converged.
+
+        Parameters
+        ----------
+        candidates : list[ResidueCandidate]
+            Pre-scored candidates from the main scoring pass.
+        created_dirs_by_chain : set[str]
+            Canonical paths of directories created during the traced session.
+        max_iterations : int
+            Maximum number of expansion rounds (default 3).
+        progress_cb, cancel_cb : callable, optional
+            Progress reporting and cancellation callbacks.
+
+        Returns
+        -------
+        list[ResidueCandidate]
+            The expanded candidate list (superset of the input).
+        """
         out = list(candidates)
         # Build a shared seen set once; expansion methods maintain it incrementally.
         seen: Set[tuple] = set()
@@ -1364,30 +1422,47 @@ class ProcmonAnalyzer:
                     pct = 86 + (step * 4) // total_steps
                     progress_cb(pct, f"Genişlənmə ({iteration + 1}/{max_iterations}): {label}")
 
+            # ── Addım 1: Kök klaster genişlənməsi ──────────────────────
+            # Score ≥ 80 olan "kök" namizədlərin ailə ID-ləri (vendor,
+            # service, rename, installer) vasitəsilə əlaqəli namizədlər
+            # tapılır və onların xalları +20 artırılır.
             _report("kök klasterlər")
             out = self._expand_confirmed_root_clusters(out)
             step += 1
             if cancel_cb and cancel_cb():
                 break
 
+            # ── Addım 2: Fayl sistemi və registr qonşuluğu ───────────
+            # Hər bir təsdiqlənmiş qalıq (score ≥ 55) üçün ana qovluq
+            # gəzilir (4 səviyyəyə qədər) və qonşu registr açarları
+            # binary-search ilə tapılır.
             _report("qonşuluq + mövcud fayllar")
             out = self._expand_fs_and_registry(out, seen)
             step += 1
             if cancel_cb and cancel_cb():
                 break
 
+            # ── Addım 3: Registr budaq taraması ───────────────────────
+            # Registr tipli qalıqların (score ≥ 50) bütün alt açar və
+            # dəyərləri sadalanır və nəticə siyahısına əlavə olunur.
             _report("registr budaqları")
             out = self._expand_confirmed_registry_branches(out, seen)
             step += 1
             if cancel_cb and cancel_cb():
                 break
 
+            # ── Addım 4: Qardaş fayllar ──────────────────────────────
+            # Eyni əsas adı paylaşan fayllar (fərqli uzantı) və ya eyni
+            # ana açarı paylaşan registr açarları əlavə olunur.
             _report("qardaş fayllar")
             out = self._expand_siblings(out, seen)
             step += 1
             if cancel_cb and cancel_cb():
                 break
 
+            # ── Addım 5: Ana qovluqlar ───────────────────────────────
+            # Əgər namizədin ana qovluğu izlənən sessiya zamanı
+            # yaradılıbsa, o da qovluq namizədi kimi əlavə olunur.
             _report("ana qovluqlar")
             out = self._add_parent_directory_candidates(out, created_dirs_by_chain)
             step += 1
@@ -1404,6 +1479,19 @@ class ProcmonAnalyzer:
         return out
 
     def _expand_confirmed_root_clusters(self, candidates: List[ResidueCandidate]) -> List[ResidueCandidate]:
+        """Addım 1 – Kök klaster genişlənməsi.
+
+        Score ≥ 80 olan yüksək etibarlı namizədlər "kök" kimi seçilir.
+        Bu köklərlə ailə ID-si (vendor_family_id, service_branch_id,
+        rename_family_id, installer_cluster_id) üzrə əlaqəli olan
+        namizədlər tapılır və onların xalı +20 artırılır.  Proses
+        tranzitiv BFS ilə yayılır: əvvəlcə birbaşa əlaqəli namizədlər,
+        sonra onların əlaqələri və s.
+
+        DuckDB mövcuddursa rekursiv CTE ilə, əks halda Python BFS ilə
+        icra olunur.  Həmçinin "mirror" qovluqları (məs. x86/x64
+        variantları) tapılıb əlavə olunur.
+        """
         if _DUCKDB_AVAILABLE:
             try:
                 return self._expand_root_clusters_duckdb(candidates)
@@ -1761,6 +1849,14 @@ class ProcmonAnalyzer:
         return out
 
     def _expand_confirmed_registry_branches(self, candidates: List[ResidueCandidate], shared_seen: Optional[Set[tuple]] = None) -> List[ResidueCandidate]:
+        """Addım 3 – Registr budaq taraması.
+
+        Score ≥ 50 olan registr tipli namizədlərin (reg_key, service,
+        run_entry, clsid, typelib, context_menu, shell_extension,
+        protocol_handler) bütün alt budaqları sadalanır.  Tapılan hər yeni
+        alt açar və ya dəyər nəticə siyahısına əlavə olunur; xalı valideyn
+        namizədin xalının ~55 %-i olur (minimum 35).
+        """
         out = list(candidates)
         seen = shared_seen if shared_seen is not None else {(c.type, (c.mapped_path or c.path).lower()) for c in out if (c.mapped_path or c.path)}
         for candidate in list(candidates):
@@ -1798,6 +1894,20 @@ class ProcmonAnalyzer:
         return out
 
     def _expand_siblings(self, candidates: List[ResidueCandidate], shared_seen: Optional[Set[tuple]] = None) -> List[ResidueCandidate]:
+        """Addım 4 – Qardaş fayllar və registr açarları.
+
+        Score ≥ 40 olan namizədlər üçün eyni əsas adı paylaşan "qardaş"
+        elementlər axtarılır:
+
+        * **Fayl tipləri** (file, config, database, cache, log, binary,
+          shortcut): eyni qovluqda eyni ada malik, lakin fərqli uzantılı
+          fayllar (məs. ``app.exe`` → ``app.log``, ``app.config``).
+        * **Registr tipləri** (reg_key, service, run_entry, clsid və s.):
+          eyni ana açar altındakı qardaş registr giriş­ləri.
+
+        Yeni namizədlər valideyn xalının ~50 %-i ilə əlavə olunur
+        (minimum 30).
+        """
         out = list(candidates)
         seen = shared_seen if shared_seen is not None else {(c.type, (c.mapped_path or c.path).lower()) for c in out if (c.mapped_path or c.path)}
         for candidate in list(candidates):
