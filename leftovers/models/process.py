@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 
-@dataclass
+@dataclass(slots=True)
 class ProcessInfo:
     pid: int
     proc_name: str = ""
