@@ -4,6 +4,7 @@ import hashlib
 import os
 import re
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -541,22 +542,11 @@ class ProcmonAnalyzer:
             related_pids, _, descendants_only, depth_by_pid = self.build_related_pid_set(final_patterns)
 
         if progress_cb:
-            progress_cb(7, "Yol mənbə indeksi qurulur...")
+            progress_cb(7, "Yol mənbə indeksi və hadisələr süzülür...")
 
         session_start, session_end = self._build_session_time_window(related_pids)
-        self._build_path_provenance_index(
-            related_pids,
-            cancel_cb=cancel_cb,
-            progress_cb=lambda pct, txt: progress_cb(7 + min(7, int(pct * 8 / 100)), txt) if progress_cb else None,
-        )
 
-        grouped: Dict[Tuple[str, str], List[ProcmonEvent]] = defaultdict(list)
-        group_display_path: Dict[Tuple[str, str], str] = {}
-        created_dirs_by_chain: Set[str] = set()
-
-        if progress_cb:
-            progress_cb(15, "Əlaqəli yollar müəyyən edilir...")
-
+        # Build related parent directories index from already-indexed by_pid
         related_parent_dirs: Set[str] = set()
         related_parent_reg: Set[str] = set()
         for pid in related_pids:
@@ -573,27 +563,111 @@ class ProcmonAnalyzer:
                     if parent_dir:
                         related_parent_dirs.add(parent_dir)
 
-        if progress_cb:
-            progress_cb(16, "Hadisələr süzülür...")
+        grouped: Dict[Tuple[str, str], List[ProcmonEvent]] = defaultdict(list)
+        group_display_path: Dict[Tuple[str, str], str] = {}
+        created_dirs_by_chain: Set[str] = set()
+
+        # ── Merged pass: provenance index + event filtering ──
+        # Previously these were two separate O(n) iterations over all events.
+        # Combining them into a single pass halves the iteration cost.
+        prov_facts: Dict[str, Dict[str, object]] = {}
+        prov_family_facts: Dict[str, Dict[str, object]] = {}
+
+        def _ensure_fact(key: str) -> Dict[str, object]:
+            if key not in prov_facts:
+                prov_facts[key] = {
+                    "first_creator_pid": None,
+                    "first_writer_pid": None,
+                    "writer_pids": set(),
+                    "touched_pids": set(),
+                    "related_write_count": 0,
+                    "non_related_write_count": 0,
+                    "create_count": 0,
+                    "rename_in": [],
+                    "rename_out": [],
+                }
+            return prov_facts[key]
+
+        def _ensure_family_fact(key: str) -> Dict[str, object]:
+            if key not in prov_family_facts:
+                prov_family_facts[key] = {
+                    "first_creator_pid": None,
+                    "first_writer_pid": None,
+                    "writer_pids": set(),
+                    "touched_pids": set(),
+                    "related_write_count": 0,
+                    "non_related_write_count": 0,
+                    "create_count": 0,
+                    "rename_in": [],
+                    "rename_out": [],
+                }
+            return prov_family_facts[key]
+
+        def _apply_provenance(item: Dict[str, object], ev: ProcmonEvent, is_creator: bool, is_writer: bool) -> None:
+            if ev.pid is not None:
+                cast_set = item["touched_pids"]
+                if isinstance(cast_set, set):
+                    cast_set.add(ev.pid)
+            if is_creator:
+                item["create_count"] = int(item["create_count"]) + 1
+                if item["first_creator_pid"] is None:
+                    item["first_creator_pid"] = ev.pid
+            if is_writer:
+                if ev.pid is not None:
+                    writer_set = item["writer_pids"]
+                    if isinstance(writer_set, set):
+                        writer_set.add(ev.pid)
+                if item["first_writer_pid"] is None:
+                    item["first_writer_pid"] = ev.pid
+                if ev.pid is not None and ev.pid in related_pids:
+                    item["related_write_count"] = int(item["related_write_count"]) + 1
+                else:
+                    item["non_related_write_count"] = int(item["non_related_write_count"]) + 1
+
+        # Local refs for speed in tight loop
+        _interesting_ops = INTERESTING_OPERATIONS
+        _related_chain_ops = RELATED_CHAIN_OPS
+        _write_ops = WRITE_OPS
+        _create_like_ops = CREATE_LIKE_OPS
 
         total_events = max(1, len(self.events))
         for idx, ev in enumerate(self.events, start=1):
             if cancel_cb and idx % 5000 == 0 and cancel_cb():
                 raise RuntimeError("İstifadəçi tərəfindən ləğv edildi.")
             if progress_cb and idx % 10000 == 0:
-                progress_cb(16 + min(23, int((idx / total_events) * 24)),
-                            f"Hadisələr süzülür... {idx:,}/{total_events:,}")
-            if not ev.path or ev.operation not in INTERESTING_OPERATIONS:
+                progress_cb(7 + min(32, int((idx / total_events) * 33)),
+                            f"İndeks və süzgəc... {idx:,}/{total_events:,}")
+            if not ev.path:
                 continue
 
+            # Compute canonical key once — reused by both provenance and filtering
             canonical_key = self.canonical_artifact_key(ev.path)
-            if not canonical_key[1]:
+            member_key = canonical_key[1]
+            if not member_key:
                 continue
-            lp = canonical_key[1]
+
+            # ── Provenance tracking (for ALL events with a path) ──
+            family_key = self._family_canonical_path_from_key(member_key)
+            prov_item = _ensure_fact(member_key)
+            prov_fam_item = _ensure_family_fact(family_key or member_key)
+
+            is_create_disposition = ev.operation == "CreateFile" and CREATEFILE_CREATE_RE.search(ev.detail or "") is not None
+            is_creator = is_create_disposition or ev.operation in _create_like_ops
+            is_prov_writer = (ev.operation in _write_ops or is_create_disposition
+                              or ev.operation == "SetRenameInformationFile"
+                              or ev.operation == "SetDispositionInformationFile")
+
+            _apply_provenance(prov_item, ev, is_creator, is_prov_writer)
+            _apply_provenance(prov_fam_item, ev, is_creator, is_prov_writer)
+
+            # ── Event filtering (only for interesting operations) ──
+            if ev.operation not in _interesting_ops:
+                continue
+
+            lp = member_key
 
             # Fast check: related-chain write gets added immediately
-            is_create_disposition = ev.operation == "CreateFile" and CREATEFILE_CREATE_RE.search(ev.detail or "") is not None
-            is_related_write = ev.pid is not None and ev.pid in related_pids and (ev.operation in RELATED_CHAIN_OPS or is_create_disposition)
+            is_related_write = ev.pid is not None and ev.pid in related_pids and (ev.operation in _related_chain_ops or is_create_disposition)
 
             if is_related_write:
                 grouped[canonical_key].append(ev)
@@ -613,11 +687,48 @@ class ProcmonAnalyzer:
             grouped[canonical_key].append(ev)
             group_display_path.setdefault(canonical_key, ev.path)
 
+        # Provenance: process rename edges (post-loop)
+        for src, dst, _, _ in self.rename_edges:
+            src_member = self._canonical_path(src)
+            dst_member = self._canonical_path(dst)
+            src_family = self._family_canonical_path(src)
+            dst_family = self._family_canonical_path(dst)
+            if src_member:
+                _ensure_fact(src_member)["rename_out"].append(normalize_path(dst))
+            if dst_member:
+                _ensure_fact(dst_member)["rename_in"].append(normalize_path(src))
+            if src_family:
+                _ensure_family_fact(src_family)["rename_out"].append(normalize_path(dst))
+            if dst_family:
+                _ensure_family_fact(dst_family)["rename_in"].append(normalize_path(src))
+
+        self.path_facts = prov_facts
+        self.path_family_facts = prov_family_facts
+
         if progress_cb:
             progress_cb(40, "GUID əlaqələri yoxlanılır...")
 
         related_guids = self._collect_related_guids(related_pids)
         self._expand_grouped_with_guid_hits(grouped, related_guids, group_display_path=group_display_path, cancel_cb=cancel_cb)
+
+        # ── Batch path existence checks in parallel (I/O-bound) ──
+        # Pre-compute all path existence results using a thread pool so the
+        # scoring loop below can look them up without blocking on I/O.
+        _path_exists_cache: Dict[str, Optional[bool]] = {}
+        _paths_to_check: Dict[str, str] = {}  # mapped_path -> original_path
+        for group_key, evs in grouped.items():
+            gpath = group_display_path.get(group_key, evs[0].path if evs else group_key[1])
+            mapped = map_sandbox_user_path(gpath)
+            if not path_looks_sandbox(gpath) or mapped != gpath:
+                _paths_to_check[mapped] = gpath
+
+        if _paths_to_check:
+            def _check_exists(p: str) -> Tuple[str, Optional[bool]]:
+                return p, self._path_exists(p)
+
+            with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as pool:
+                for checked_path, result in pool.map(_check_exists, _paths_to_check.keys()):
+                    _path_exists_cache[checked_path] = result
 
         if progress_cb:
             progress_cb(42, f"Qruplar analiz olunur... (0/{len(grouped):,})")
@@ -858,7 +969,9 @@ class ProcmonAnalyzer:
                 raw_score += pen["generic_dir"]
 
             mapped = map_sandbox_user_path(path)
-            exists_now = self._path_exists(mapped) if not path_looks_sandbox(path) or mapped != path else None
+            exists_now = _path_exists_cache.get(mapped) if mapped in _path_exists_cache else (
+                self._path_exists(mapped) if not path_looks_sandbox(path) or mapped != path else None
+            )
             if path_looks_sandbox(path) and mapped == path:
                 reasons.append("sandbox path could not be mapped to current user")
 
@@ -1909,14 +2022,34 @@ class ProcmonAnalyzer:
         candidates: List[ResidueCandidate],
         term_patterns: Dict[str, List[Tuple[str, re.Pattern[str], float]]],
     ) -> None:
-        for candidate in candidates:
-            if candidate.exists_now is not True:
-                continue
-            if candidate.type not in {"file", "binary"}:
-                continue
+        # Collect candidates eligible for metadata enrichment
+        eligible = [
+            c for c in candidates
+            if c.exists_now is True and c.type in {"file", "binary"}
+        ]
+        if not eligible:
+            return
 
-            # Authenticode / trusted publisher check (Təklif 3)
-            if is_trusted_signed(candidate.mapped_path):
+        # Phase 1: Read metadata from disk in parallel (I/O-bound)
+        def _read_meta(mapped_path: str) -> Tuple[str, Optional[bool], Optional[Dict[str, str]]]:
+            """Returns (mapped_path, is_trusted, version_info)."""
+            trusted = is_trusted_signed(mapped_path)
+            if trusted:
+                return mapped_path, True, None
+            info = read_file_version_info(mapped_path)
+            return mapped_path, False, info
+
+        meta_results: Dict[str, Tuple[Optional[bool], Optional[Dict[str, str]]]] = {}
+        unique_paths = list({c.mapped_path for c in eligible})
+        with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4)) as pool:
+            for path, trusted, info in pool.map(_read_meta, unique_paths):
+                meta_results[path] = (trusted, info)
+
+        # Phase 2: Apply results (single-threaded, mutates candidates)
+        for candidate in eligible:
+            trusted, info = meta_results.get(candidate.mapped_path, (False, None))
+
+            if trusted:
                 candidate.status = "ignore"
                 candidate.raw_score = max(0, candidate.raw_score - 50)
                 candidate.score = max(0, min(candidate.raw_score, 100))
@@ -1925,7 +2058,6 @@ class ProcmonAnalyzer:
                 )
                 continue  # Never touch signed system files
 
-            info = read_file_version_info(candidate.mapped_path)
             if not info:
                 continue
             metadata_text = " ".join(v for v in [info.get("CompanyName", ""), info.get("ProductName", "")] if v)
