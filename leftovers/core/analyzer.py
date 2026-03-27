@@ -542,7 +542,7 @@ class ProcmonAnalyzer:
             related_pids, _, descendants_only, depth_by_pid = self.build_related_pid_set(final_patterns)
 
         if progress_cb:
-            progress_cb(7, "Yol mənbə indeksi qurulur / Hadisələr süzülür...")
+            progress_cb(7, "Yol mənbə indeksi və hadisələr süzülür...")
 
         session_start, session_end = self._build_session_time_window(related_pids)
 
@@ -636,7 +636,7 @@ class ProcmonAnalyzer:
                 raise RuntimeError("İstifadəçi tərəfindən ləğv edildi.")
             if progress_cb and idx % 10000 == 0:
                 progress_cb(7 + min(32, int((idx / total_events) * 33)),
-                            f"İndeks + süzgəc... {idx:,}/{total_events:,}")
+                            f"İndeks və süzgəc... {idx:,}/{total_events:,}")
             if not ev.path:
                 continue
 

@@ -22,7 +22,7 @@ class ProcmonEvent:
     # repr=False) keeps it out of __init__ / __repr__ while still having a
     # slot allocated for it (required by slots=True).
     _parsed_detail: Optional[Dict[str, str]] = field(
-        default=None, init=False, repr=False, compare=False,
+        default=None, init=False, repr=False, compare=False
     )
 
     @property
