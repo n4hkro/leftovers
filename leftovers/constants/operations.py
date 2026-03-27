@@ -32,7 +32,7 @@ STOP_AT_PARENTS = {
     "system",
 }
 
-INTERESTING_OPERATIONS = {
+INTERESTING_OPERATIONS = frozenset({
     "CreateFile",
     "WriteFile",
     "CreateDirectory",
@@ -53,7 +53,7 @@ INTERESTING_OPERATIONS = {
     "Process Create",
     "Process Exit",
     "Load Image",
-}
+})
 
 QUERY_ONLY_OPS = frozenset(
     {

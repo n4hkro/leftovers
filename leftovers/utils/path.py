@@ -20,21 +20,24 @@ from leftovers.constants.paths import (
 )
 
 
+_MULTI_BACKSLASH_RE = re.compile(r"\\+")
+
+
 def normalize_path(path: str) -> str:
     p = (path or "").strip().strip('"')
     p = p.replace("/", "\\")
     # EDGE-2 fix: Preserve UNC prefix
     is_unc = p.startswith("\\\\")
-    p = re.sub(r"\\+", r"\\", p)
+    p = _MULTI_BACKSLASH_RE.sub(r"\\", p)
     if is_unc:
         p = "\\" + p  # Restore double backslash for UNC paths
     return p
 
 
-# Pre-normalized prefix lists for fast lookups
-_NORM_LOW_VALUE_PATHS = [normalize_path(prefix).lower() for prefix in LOW_VALUE_PATH_PREFIXES]
-_NORM_LOW_VALUE_REGS = [normalize_path(prefix).lower() for prefix in LOW_VALUE_REG_PREFIXES]
-_NORM_SAFE_PREFIXES = [normalize_path(prefix).lower() for prefix in SAFE_PATH_PREFIXES_FOR_REPORT]
+# Pre-normalized prefix tuples for fast startswith() lookups
+_NORM_LOW_VALUE_PATHS = tuple(normalize_path(prefix).lower() for prefix in LOW_VALUE_PATH_PREFIXES)
+_NORM_LOW_VALUE_REGS = tuple(normalize_path(prefix).lower() for prefix in LOW_VALUE_REG_PREFIXES)
+_NORM_SAFE_PREFIXES = tuple(normalize_path(prefix).lower() for prefix in SAFE_PATH_PREFIXES_FOR_REPORT)
 
 
 def get_wow64_equivalents(path: str) -> List[str]:
@@ -67,18 +70,12 @@ def get_wow64_equivalents(path: str) -> List[str]:
 
 def path_is_low_value(path: str) -> bool:
     lp = (path or "").lower()
-    for prefix in _NORM_LOW_VALUE_PATHS:
-        if lp.startswith(prefix):
-            return True
-    for prefix in _NORM_LOW_VALUE_REGS:
-        if lp.startswith(prefix):
-            return True
-    return False
+    return lp.startswith(_NORM_LOW_VALUE_PATHS) or lp.startswith(_NORM_LOW_VALUE_REGS)
 
 
 def path_has_safe_prefix(path: str) -> bool:
     lp = (path or "").lower()
-    if any(lp.startswith(prefix) for prefix in _NORM_SAFE_PREFIXES):
+    if lp.startswith(_NORM_SAFE_PREFIXES):
         return True
     return any(rx.match(lp) for rx in SAFE_PATH_REGEXES)
 
@@ -105,7 +102,7 @@ def map_sandbox_user_path(path: str) -> str:
     if not username:
         return p
     lower_p = p.lower()
-    if any(lower_p.startswith(prefix) for prefix in REGISTRY_PREFIXES):
+    if lower_p.startswith(REGISTRY_PREFIXES):
         return p
     mapped = p
     mapped = _replace_ci(mapped, "C:\\Users\\WDAGUtilityAccount\\", f"C:\\Users\\{username}\\")
@@ -120,15 +117,15 @@ def path_looks_sandbox(path: str) -> bool:
 
 def detect_item_type(path: str) -> str:
     lp = (path or "").lower()
-    if any(lp.startswith(prefix) for prefix in USERASSIST_PREFIXES):
+    if lp.startswith(USERASSIST_PREFIXES):
         return "execution_trace"
-    if any(lp.startswith(prefix) for prefix in MUI_CACHE_PREFIXES) or any(lp.startswith(prefix) for prefix in BAM_PREFIXES):
+    if lp.startswith(MUI_CACHE_PREFIXES) or lp.startswith(BAM_PREFIXES):
         return "execution_trace"
     if "\\prefetch\\" in lp and lp.endswith(".pf"):
         return "prefetch_trace"
     if lp.startswith("c:\\programdata\\microsoft\\windows\\wer\\reportarchive\\") or "\\crashdumps\\" in lp:
         return "crash_dump"
-    if any(lp.startswith(prefix) for prefix in FIREWALL_RULES_PREFIXES):
+    if lp.startswith(FIREWALL_RULES_PREFIXES):
         return "firewall_rule"
     if lp.startswith("hkcr\\clsid\\"):
         return "clsid"
@@ -156,9 +153,9 @@ def detect_item_type(path: str) -> str:
         return "startup_shortcut"
     # LOGIC-2 fix: check uninstall_key BEFORE the generic reg_key catch-all
     # LOGIC-3 fix: Use UNINSTALL_KEY_PREFIXES for more precise detection
-    if any(lp.startswith(prefix) for prefix in UNINSTALL_KEY_PREFIXES):
+    if lp.startswith(UNINSTALL_KEY_PREFIXES):
         return "uninstall_key"
-    if any(lp.startswith(prefix) for prefix in REGISTRY_PREFIXES):
+    if lp.startswith(REGISTRY_PREFIXES):
         return "reg_key"
     if lp.endswith(".lnk"):
         return "shortcut"
@@ -202,7 +199,7 @@ def category_from_type(item_type: str) -> str:
 
 def cluster_from_path(path: str) -> str:
     lp = (path or "").lower()
-    if any(lp.startswith(prefix) for prefix in REGISTRY_PREFIXES):
+    if lp.startswith(REGISTRY_PREFIXES):
         return "registry"
     if lp.startswith("c:\\program files"):
         return "program_files"
@@ -212,6 +209,6 @@ def cluster_from_path(path: str) -> str:
         return "app_data"
     if lp.startswith(WINDOWS_INSTALLER_PREFIX):
         return "installer_cache"
-    if "\\prefetch\\" in lp or any(lp.startswith(prefix) for prefix in MUI_CACHE_PREFIXES) or any(lp.startswith(prefix) for prefix in BAM_PREFIXES):
+    if "\\prefetch\\" in lp or lp.startswith(MUI_CACHE_PREFIXES) or lp.startswith(BAM_PREFIXES):
         return "execution_traces"
     return "other"

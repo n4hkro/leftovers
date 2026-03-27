@@ -6,6 +6,16 @@ from typing import Dict, List, Optional
 
 from leftovers.constants.trust import STOP_WORDS
 
+# Pre-compiled regexes for hot-path functions
+_DETAIL_SPLIT_RE = re.compile(r',\s*(?=[A-Za-z][A-Za-z\s]*:)')
+_SPACES_RE = re.compile(r"\s+")
+_NON_ALNUM_RE = re.compile(r"[^A-Za-z0-9]+")
+_ROT13_TABLE = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+    "NOPQRSTUVWXYZABCDEFGHIJKLMnopqrstuvwxyzabcdefghijklm",
+)
+_TIME_FORMATS = ["%I:%M:%S.%f %p", "%I:%M:%S %p", "%H:%M:%S.%f", "%H:%M:%S"]
+
 
 def parse_detail(detail: str) -> Dict[str, str]:
     """
@@ -22,7 +32,7 @@ def parse_detail(detail: str) -> Dict[str, str]:
     result: Dict[str, str] = {}
     if not detail:
         return result
-    parts = re.split(r',\s*(?=[A-Za-z][A-Za-z\s]*:)', detail)
+    parts = _DETAIL_SPLIT_RE.split(detail)
     for part in parts:
         part = part.strip()
         if ':' not in part:
@@ -36,7 +46,7 @@ def parse_detail(detail: str) -> Dict[str, str]:
 
 
 def normalize_spaces(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").strip())
+    return _SPACES_RE.sub(" ", (text or "").strip())
 
 
 def safe_int(value: str) -> Optional[int]:
@@ -51,7 +61,7 @@ def normalize_proc_name(name: str) -> str:
 
 
 def split_tokens(text: str) -> List[str]:
-    text = re.sub(r"[^A-Za-z0-9]+", " ", text or "")
+    text = _NON_ALNUM_RE.sub(" ", text or "")
     out: List[str] = []
     for token in text.split():
         token = token.strip().lower()
@@ -64,21 +74,29 @@ def split_tokens(text: str) -> List[str]:
 
 
 def rot13(text: str) -> str:
-    return text.translate(
-        str.maketrans(
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
-            "NOPQRSTUVWXYZABCDEFGHIJKLMnopqrstuvwxyzabcdefghijklm",
-        )
-    )
+    return text.translate(_ROT13_TABLE)
+
+
+# Cache the last successful time format to try it first next time
+_last_time_fmt: Optional[str] = None
 
 
 def parse_procmon_time_to_dt(value: str) -> Optional[datetime]:
+    global _last_time_fmt
     text = (value or "").strip()
     if not text:
         return None
-    for fmt in ["%I:%M:%S.%f %p", "%I:%M:%S %p", "%H:%M:%S.%f", "%H:%M:%S"]:
+    # Try the last successful format first for speed
+    if _last_time_fmt is not None:
         try:
-            return datetime.strptime(text, fmt)
+            return datetime.strptime(text, _last_time_fmt)
+        except ValueError:
+            pass
+    for fmt in _TIME_FORMATS:
+        try:
+            result = datetime.strptime(text, fmt)
+            _last_time_fmt = fmt
+            return result
         except ValueError:
             continue
     return None
