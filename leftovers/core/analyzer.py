@@ -74,6 +74,10 @@ from leftovers.utils.trust import (
     read_file_version_info,
 )
 
+# Pre-computed frozenset for modification operations used in hot loops
+_MODIFY_OPS = frozenset(WRITE_OPS | {"RegDeleteKey", "RegDeleteValue", "SetDispositionInformationFile"})
+
+
 class ProcmonAnalyzer:
     def __init__(
         self,
@@ -196,9 +200,13 @@ class ProcmonAnalyzer:
         if progress_cb:
             progress_cb(100, "İndeksləmə tamamlandı")
 
+    _PID_RE = re.compile(r"PID:\s*(\d+)", re.IGNORECASE)
+    _CMD_LINE_RE = re.compile(r"Command line:\s*([^,]+)", re.IGNORECASE)
+    _FILENAME_RE = re.compile(r"FileName:\s*([^,]+)", re.IGNORECASE)
+
     @staticmethod
     def _extract_child_pid(detail: str) -> Optional[int]:
-        match = re.search(r"PID:\s*(\d+)", detail or "", re.IGNORECASE)
+        match = ProcmonAnalyzer._PID_RE.search(detail or "")
         if match:
             return safe_int(match.group(1))
         return None
@@ -209,14 +217,14 @@ class ProcmonAnalyzer:
             base = os.path.basename(path)
             if base:
                 return base
-        match = re.search(r"Command line:\s*([^,]+)", detail or "", re.IGNORECASE)
+        match = ProcmonAnalyzer._CMD_LINE_RE.search(detail or "")
         if match:
             return os.path.basename(match.group(1).strip().strip('"'))
         return ""
 
     @staticmethod
     def _extract_rename_target(detail: str) -> str:
-        match = re.search(r"FileName:\s*([^,]+)", detail or "", re.IGNORECASE)
+        match = ProcmonAnalyzer._FILENAME_RE.search(detail or "")
         if not match:
             return ""
         return normalize_path(match.group(1).strip().strip('"'))
@@ -231,7 +239,7 @@ class ProcmonAnalyzer:
                 p = short_root + p[len(long_root) :]
                 break
 
-        artifact_type = "registry" if any(p.startswith(prefix) for prefix in REGISTRY_PREFIXES) else "filesystem"
+        artifact_type = "registry" if p.startswith(REGISTRY_PREFIXES) else "filesystem"
         return artifact_type, p
 
     def _canonical_path(self, path: str) -> str:
@@ -335,7 +343,7 @@ class ProcmonAnalyzer:
 
             is_create_disposition = ev.operation == "CreateFile" and CREATEFILE_CREATE_RE.search(ev.detail or "") is not None
             is_creator = is_create_disposition or ev.operation in CREATE_LIKE_OPS
-            is_writer = ev.operation in WRITE_OPS or is_create_disposition or ev.operation in {"SetRenameInformationFile", "SetDispositionInformationFile"}
+            is_writer = ev.operation in WRITE_OPS or is_create_disposition or ev.operation == "SetRenameInformationFile" or ev.operation == "SetDispositionInformationFile"
 
             apply_to_fact(item, ev, is_creator, is_writer)
             apply_to_fact(fam_item, ev, is_creator, is_writer)
@@ -401,42 +409,44 @@ class ProcmonAnalyzer:
         descendants_only = expanded - root_seed_pids
         return expanded, root_seed_pids, descendants_only, depth_by_pid
 
-    def _discover_dynamic_terms(self, term_patterns: Dict[str, List[Tuple[str, re.Pattern[str], float]]]) -> List[str]:
-        discovered: Set[str] = set()
-        for ev in self.events:
-            lp = (ev.path or "").lower()
-            if not any(lp.startswith(prefix) for prefix in UNINSTALL_KEY_PREFIXES):
-                continue
-            if not (token_hits(ev.path or "", term_patterns) or token_hits(ev.detail or "", term_patterns)):
-                continue
-            value_text = ev.detail or ""
-            for match in re.finditer(r"([A-Za-z]:\\[^,;\"]+)", value_text):
-                extracted = normalize_path(match.group(1).strip())
-                if not extracted:
-                    continue
-                if extracted.lower().endswith(".exe"):
-                    extracted = normalize_path(os.path.dirname(extracted))
-                if extracted:
-                    discovered.add(extracted)
-        return sorted(discovered)
+    _PREFETCH_PF_RE = re.compile(r"\\([^\\]+)\.exe-[0-9a-f]+\.pf$")
+    _DETAIL_PATH_RE = re.compile(r"([A-Za-z]:\\[^,;\"]+)")
 
-    def _extract_execution_trace_aliases(self) -> List[str]:
+    def _discover_terms_and_aliases(
+        self,
+        term_patterns: Dict[str, List[Tuple[str, re.Pattern[str], float]]],
+    ) -> Tuple[List[str], List[str]]:
+        """Combined single-pass version of _discover_dynamic_terms + _extract_execution_trace_aliases."""
+        discovered: Set[str] = set()
         aliases: Set[str] = set()
         for ev in self.events:
             lp = (ev.path or "").lower()
+            # Dynamic term discovery from uninstall keys
+            if lp.startswith(UNINSTALL_KEY_PREFIXES):
+                if token_hits(ev.path or "", term_patterns) or token_hits(ev.detail or "", term_patterns):
+                    value_text = ev.detail or ""
+                    for match in self._DETAIL_PATH_RE.finditer(value_text):
+                        extracted = normalize_path(match.group(1).strip())
+                        if not extracted:
+                            continue
+                        if extracted.lower().endswith(".exe"):
+                            extracted = normalize_path(os.path.dirname(extracted))
+                        if extracted:
+                            discovered.add(extracted)
+            # Execution trace aliases
             if "\\prefetch\\" in lp and lp.endswith(".pf"):
-                m = re.search(r"\\([^\\]+)\.exe-[0-9a-f]+\.pf$", lp)
+                m = self._PREFETCH_PF_RE.search(lp)
                 if m:
                     aliases.update(split_tokens(m.group(1)))
-            if any(lp.startswith(prefix) for prefix in USERASSIST_PREFIXES):
+            if lp.startswith(USERASSIST_PREFIXES):
                 decoded = rot13(ev.path or "") + " " + rot13(ev.detail or "")
                 aliases.update(split_tokens(decoded))
-            if any(lp.startswith(prefix) for prefix in MUI_CACHE_PREFIXES):
+            if lp.startswith(MUI_CACHE_PREFIXES):
                 aliases.update(split_tokens(ev.detail or ""))
-            if any(lp.startswith(prefix) for prefix in BAM_PREFIXES):
+            if lp.startswith(BAM_PREFIXES):
                 aliases.update(split_tokens(ev.path or ""))
                 aliases.update(split_tokens(ev.detail or ""))
-        return sorted(aliases)
+        return sorted(discovered), sorted(aliases)
 
     def _collect_related_guids(self, related_pids: Set[int]) -> Set[str]:
         guids: Set[str] = set()
@@ -462,13 +472,15 @@ class ProcmonAnalyzer:
     ) -> None:
         if not guid_tokens:
             return
+        # Build a single compiled regex from all GUIDs for fast matching
+        guid_pattern = re.compile("|".join(re.escape(g) for g in guid_tokens))
         for idx, ev in enumerate(self.events, start=1):
             if cancel_cb and idx % 4000 == 0 and cancel_cb():
                 raise RuntimeError("İstifadəçi tərəfindən ləğv edildi.")
             if not ev.path:
                 continue
             sample = f"{ev.path} {ev.detail}".lower()
-            if any(guid in sample for guid in guid_tokens):
+            if guid_pattern.search(sample):
                 key = self.canonical_artifact_key(ev.path)
                 if not key[1]:
                     continue
@@ -501,8 +513,7 @@ class ProcmonAnalyzer:
             progress_cb(1, "Terminlər genişləndirilir...")
 
         seed_patterns = compile_term_patterns(root_terms)
-        dynamic_locations = self._discover_dynamic_terms(seed_patterns)
-        exec_aliases = self._extract_execution_trace_aliases()
+        dynamic_locations, exec_aliases = self._discover_terms_and_aliases(seed_patterns)
         pass1_terms = self._dedupe_terms(root_terms + dynamic_locations + exec_aliases)
         pass1_patterns = compile_term_patterns(pass1_terms)
         related_pids, _, descendants_only, depth_by_pid = self.build_related_pid_set(pass1_patterns)
@@ -553,7 +564,7 @@ class ProcmonAnalyzer:
                 if not ev.path:
                     continue
                 _, canon = self.canonical_artifact_key(ev.path)
-                if any(canon.startswith(prefix) for prefix in REGISTRY_PREFIXES):
+                if canon.startswith(REGISTRY_PREFIXES):
                     parent_reg = normalize_path(os.path.dirname(canon)).lower()
                     if parent_reg:
                         related_parent_reg.add(parent_reg)
@@ -567,9 +578,9 @@ class ProcmonAnalyzer:
 
         total_events = max(1, len(self.events))
         for idx, ev in enumerate(self.events, start=1):
-            if cancel_cb and idx % 2000 == 0 and cancel_cb():
+            if cancel_cb and idx % 5000 == 0 and cancel_cb():
                 raise RuntimeError("İstifadəçi tərəfindən ləğv edildi.")
-            if progress_cb and idx % 5000 == 0:
+            if progress_cb and idx % 10000 == 0:
                 progress_cb(16 + min(23, int((idx / total_events) * 24)),
                             f"Hadisələr süzülür... {idx:,}/{total_events:,}")
             if not ev.path or ev.operation not in INTERESTING_OPERATIONS:
@@ -579,12 +590,10 @@ class ProcmonAnalyzer:
             if not canonical_key[1]:
                 continue
             lp = canonical_key[1]
+
+            # Fast check: related-chain write gets added immediately
             is_create_disposition = ev.operation == "CreateFile" and CREATEFILE_CREATE_RE.search(ev.detail or "") is not None
             is_related_write = ev.pid is not None and ev.pid in related_pids and (ev.operation in RELATED_CHAIN_OPS or is_create_disposition)
-            is_installer_path = lp.startswith(WINDOWS_INSTALLER_PREFIX)
-            reg_sweep = any(lp.startswith(prefix) for prefix in REGISTRY_SWEEP_PREFIXES)
-            path_hit = bool(token_hits(lp, final_patterns, allow_rot13=False))
-            detail_hit = bool(token_hits(ev.detail or "", final_patterns, allow_rot13=any(lp.startswith(prefix) for prefix in USERASSIST_PREFIXES)))
 
             if is_related_write:
                 grouped[canonical_key].append(ev)
@@ -592,6 +601,12 @@ class ProcmonAnalyzer:
                 if ev.operation == "CreateDirectory" and ev.pid is not None and ev.pid in related_pids:
                     created_dirs_by_chain.add(canonical_key[1])
                 continue
+
+            # Slower checks only when not a related write
+            is_installer_path = lp.startswith(WINDOWS_INSTALLER_PREFIX)
+            reg_sweep = lp.startswith(REGISTRY_SWEEP_PREFIXES)
+            path_hit = bool(token_hits(lp, final_patterns, allow_rot13=False))
+            detail_hit = bool(token_hits(ev.detail or "", final_patterns, allow_rot13=lp.startswith(USERASSIST_PREFIXES)))
 
             if not (path_has_safe_prefix(ev.path) or is_installer_path or reg_sweep or path_hit or detail_hit):
                 continue
@@ -644,9 +659,15 @@ class ProcmonAnalyzer:
             non_related_writer_in_window = False
             location_proximity_hit = False
 
+            # Hoist invariant computation out of the inner event loop
+            allow_rot13 = lp.startswith(USERASSIST_PREFIXES)
+            has_session_window = bool(session_start and session_end)
+            # Pre-compute parent_ref and location prefix check once per group
+            parent_ref = normalize_path(os.path.dirname(lp)).lower() if has_session_window else ""
+            lp_has_location_prefix = lp.startswith(("c:\\users\\", "c:\\programdata\\", "hkcu\\software\\"))
+
             for ev in evs:
-                allow_rot13 = any(lp.startswith(prefix) for prefix in USERASSIST_PREFIXES)
-                if token_hits(ev.detail or "", final_patterns, allow_rot13=allow_rot13):
+                if not detail_match and token_hits(ev.detail or "", final_patterns, allow_rot13=allow_rot13):
                     detail_match = True
                 is_create_disposition = ev.operation == "CreateFile" and CREATEFILE_CREATE_RE.search(ev.detail or "") is not None
                 is_write = ev.operation in WRITE_OPS or is_create_disposition
@@ -655,27 +676,21 @@ class ProcmonAnalyzer:
                     write_count += 1
                     if ev.pid is not None:
                         last_writer_pid = ev.pid
-                if ev.operation in WRITE_OPS or ev.operation in {"RegDeleteKey", "RegDeleteValue", "SetDispositionInformationFile"}:
+                if ev.operation in _MODIFY_OPS:
                     modified_flag = True
-                if session_start and session_end and ev.pid not in related_pids and is_write:
+                if has_session_window and is_write:
                     ev_dt = parse_procmon_time_to_dt(ev.time_of_day)
                     if ev_dt and session_start <= ev_dt <= session_end:
-                        non_related_writer_in_window = True
-                if session_start and session_end and is_write:
-                    ev_dt = parse_procmon_time_to_dt(ev.time_of_day)
-                    if ev_dt and session_start <= ev_dt <= session_end:
-                        parent_ref = normalize_path(os.path.dirname(lp)).lower()
-                        if any(lp.startswith(prefix) for prefix in ("c:\\users\\", "c:\\programdata\\", "hkcu\\software\\")) and (
+                        if ev.pid not in related_pids:
+                            non_related_writer_in_window = True
+                        if lp_has_location_prefix and (
                             parent_ref in related_parent_dirs or parent_ref in related_parent_reg
                         ):
                             location_proximity_hit = True
 
             is_prefetch_trace = "\\prefetch\\" in lp and lp.endswith(".pf")
-            execution_trace_hit = (
-                any(lp.startswith(prefix) for prefix in MUI_CACHE_PREFIXES)
-                or any(lp.startswith(prefix) for prefix in BAM_PREFIXES)
-                or any(lp.startswith(prefix) for prefix in USERASSIST_PREFIXES)
-            ) and (path_weight > 0 or detail_match)
+            is_exec_trace_prefix = lp.startswith(MUI_CACHE_PREFIXES) or lp.startswith(BAM_PREFIXES) or allow_rot13
+            execution_trace_hit = is_exec_trace_prefix and (path_weight > 0 or detail_match)
 
             if path_is_low_value(path):
                 if is_prefetch_trace and path_weight > 0:
@@ -700,10 +715,10 @@ class ProcmonAnalyzer:
             if detail_match:
                 raw_score += self.config["match_scores"]["detail_match"]
                 reasons.append("token found in detail/value data")
-                if any(lp.startswith(prefix) for prefix in USERASSIST_PREFIXES):
+                if allow_rot13:
                     reasons.append("UserAssist ROT13 match (decoded)")
 
-            if any(lp.startswith(prefix) for prefix in FIREWALL_RULES_PREFIXES) and any(token_hits(ev.detail or "", final_patterns) for ev in evs):
+            if lp.startswith(FIREWALL_RULES_PREFIXES) and any(token_hits(ev.detail or "", final_patterns) for ev in evs):
                 raw_score += self.config["special"]["firewall_rule_reference"]
                 reasons.append("firewall rule references target app")
 
@@ -1413,7 +1428,7 @@ class ProcmonAnalyzer:
             if candidate.type not in {"reg_key", "service", "run_entry", "clsid", "typelib", "context_menu", "shell_extension", "protocol_handler"}:
                 continue
             lp = (candidate.path or "").lower()
-            if not any(lp.startswith(prefix) for prefix in REGISTRY_PREFIXES):
+            if not lp.startswith(REGISTRY_PREFIXES):
                 continue
             max_items = 600
             for marker, limit in REGISTRY_EXPANSION_LIMITS.items():
@@ -1846,7 +1861,7 @@ class ProcmonAnalyzer:
                 continue
             lp = (candidate.path or "").lower()
             if candidate.category == "execution_trace":
-                pf_match = re.search(r"\\([^\\]+)\.exe-[0-9a-f]+\.pf$", lp)
+                pf_match = self._PREFETCH_PF_RE.search(lp)
                 if pf_match:
                     candidate.installer_cluster_id = pf_match.group(1).lower()
                     continue
@@ -2024,7 +2039,7 @@ class ProcmonAnalyzer:
             return None
         lp = (path or "").lower()
         try:
-            if any(lp.startswith(prefix) for prefix in REGISTRY_PREFIXES):
+            if lp.startswith(REGISTRY_PREFIXES):
                 result = self._registry_path_exists(path)
                 if result is True:
                     return True
@@ -2073,7 +2088,7 @@ class ProcmonAnalyzer:
                     aliases.add(token)
         for ev in self.events:
             lp = (ev.path or "").lower()
-            if any(lp.startswith(prefix) for prefix in UNINSTALL_KEY_PREFIXES):
+            if lp.startswith(UNINSTALL_KEY_PREFIXES):
                 for token in split_tokens(ev.detail or ""):
                     if token not in STOP_WORDS:
                         aliases.add(token)
