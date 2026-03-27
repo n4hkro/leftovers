@@ -1,5 +1,6 @@
 """ProcmonAnalyzer – the main analysis engine for residue detection."""
 
+import bisect
 import hashlib
 import os
 import re
@@ -1104,10 +1105,14 @@ class ProcmonAnalyzer:
         last_seen: str,
         processes: List[str],
         operations: List[str],
+        *,
+        known_exists: Optional[bool] = None,
+        known_type: Optional[str] = None,
+        known_mapped: Optional[str] = None,
     ) -> ResidueCandidate:
-        mapped = map_sandbox_user_path(path)
-        exists_now = self._path_exists(mapped)
-        item_type = detect_item_type(path)
+        mapped = known_mapped if known_mapped is not None else map_sandbox_user_path(path)
+        exists_now = known_exists if known_exists is not None else self._path_exists(mapped)
+        item_type = known_type if known_type is not None else detect_item_type(path)
         return ResidueCandidate(
             type=item_type,
             path=path,
@@ -1471,20 +1476,18 @@ class ProcmonAnalyzer:
         out = list(candidates)
         seen = shared_seen if shared_seen is not None else {(c.type, (c.mapped_path or c.path).lower()) for c in out if (c.mapped_path or c.path)}
 
-        # PERF-1 fix: build a prefix-based index of events by registry path prefix
-        # to avoid full O(n) scan for every reg_key candidate
-        reg_events_by_prefix: Dict[str, List] = defaultdict(list)
+        # PERF-1 fix v2: sorted list + bisect for O(log n + m) registry prefix lookup
+        reg_event_pairs: List[Tuple[str, object]] = []
         for ev in self.events:
             if ev.path and ev.path.lower().startswith(REGISTRY_PREFIXES):
-                lp = ev.path.lower()
-                prefix = lp[:64]  # bucket by first 64 chars
-                # Extract the registry root prefix for better matching
-                root_end = lp.find("\\", 5)
-                if root_end > 0:
-                    prefix_key = lp[:root_end + 1]
-                else:
-                    prefix_key = prefix
-                reg_events_by_prefix[prefix_key].append(ev)
+                reg_event_pairs.append((ev.path.lower(), ev))
+        reg_event_pairs.sort(key=lambda x: x[0])
+        reg_event_keys = [p for p, _ in reg_event_pairs]
+
+        # PERF-2: track walked scan roots to avoid redundant directory traversals
+        walked_roots: Set[str] = set()
+
+        _MAX_FILES_PER_ROOT = 2000
 
         for candidate in list(candidates):
             if candidate.raw_score < 55:
@@ -1495,15 +1498,12 @@ class ProcmonAnalyzer:
                 parent = normalize_path(os.path.dirname(candidate.path))
                 if parent:
                     parent_lower = parent.lower()
-                    # Use the prefix index to find matching events efficiently
-                    matching_events = []
-                    for prefix_key, evs in reg_events_by_prefix.items():
-                        if parent_lower.startswith(prefix_key):
-                            matching_events.extend(evs)
-                    
-                    for ev in matching_events:
-                        if not ev.path or not ev.path.lower().startswith(parent_lower):
-                            continue
+                    # Binary-search to find events under parent_lower
+                    lo = bisect.bisect_left(reg_event_keys, parent_lower)
+                    for i in range(lo, len(reg_event_keys)):
+                        if not reg_event_keys[i].startswith(parent_lower):
+                            break
+                        ev = reg_event_pairs[i][1]
                         t = detect_item_type(ev.path)
                         mapped = map_sandbox_user_path(ev.path)
                         key = (t, mapped.lower())
@@ -1518,6 +1518,8 @@ class ProcmonAnalyzer:
                             ev.time_of_day,
                             [ev.process_name] if ev.process_name else [],
                             [ev.operation] if ev.operation else [],
+                            known_type=t,
+                            known_mapped=mapped,
                         )
                         out.append(new_item)
                         seen.add(key)
@@ -1530,17 +1532,24 @@ class ProcmonAnalyzer:
             vendor_root = self._derive_vendor_root(root_dir)
             scan_roots = self._mirror_vendor_roots(vendor_root) if vendor_root else [root_dir]
             for scan_root in scan_roots:
+                # PERF-2: skip already-walked roots
+                sr_key = scan_root.lower()
+                if sr_key in walked_roots:
+                    continue
+                walked_roots.add(sr_key)
                 if not os.path.isdir(scan_root):
                     continue
+                root_file_count = 0
                 for base, dirs, files in self._walk_with_generic_reset(scan_root, max_depth=4):
                     for name in files:
                         fp = normalize_path(os.path.join(base, name))
-                        # Skip trusted-signed system files (Təklif 3)
-                        if is_trusted_signed(fp):
-                            continue
+                        # PERF-3: cheap checks (type + seen) before expensive I/O
                         t = detect_item_type(fp)
                         key = (t, fp.lower())
                         if key in seen:
+                            continue
+                        # Skip trusted-signed system files (Təklif 3)
+                        if is_trusted_signed(fp):
                             continue
                         mult = self._extension_multiplier(fp)
                         raw_score = max(30, int(candidate.raw_score * mult))
@@ -1552,14 +1561,24 @@ class ProcmonAnalyzer:
                             candidate.last_seen,
                             candidate.processes,
                             ["NeighborhoodScan"],
+                            known_exists=True,
+                            known_type=t,
                         )
                         out.append(new_item)
                         seen.add(key)
+                        root_file_count += 1
+                        if root_file_count >= _MAX_FILES_PER_ROOT:
+                            break
+                    if root_file_count >= _MAX_FILES_PER_ROOT:
+                        break
         return out
 
     def _expand_survivors(self, candidates: List[ResidueCandidate], shared_seen: Optional[Set[tuple]] = None) -> List[ResidueCandidate]:
         out = list(candidates)
         seen = shared_seen if shared_seen is not None else {(c.type, (c.mapped_path or c.path).lower()) for c in out if (c.mapped_path or c.path)}
+        # PERF-2: track walked scan roots to avoid redundant directory traversals
+        walked_roots: Set[str] = set()
+        _MAX_FILES_PER_ROOT = 2000
         for candidate in list(candidates):
             if candidate.exists_now is not True or candidate.raw_score < 55:
                 continue
@@ -1570,17 +1589,23 @@ class ProcmonAnalyzer:
                 vendor_root = self._derive_vendor_root(base_dir)
                 scan_roots = self._mirror_vendor_roots(vendor_root) if vendor_root else [base_dir]
                 for scan_root in scan_roots:
+                    sr_key = scan_root.lower()
+                    if sr_key in walked_roots:
+                        continue
+                    walked_roots.add(sr_key)
                     if not os.path.isdir(scan_root):
                         continue
+                    root_file_count = 0
                     for root, dirs, files in self._walk_with_generic_reset(scan_root, max_depth=4):
                         for fname in files:
                             fp = normalize_path(os.path.join(root, fname))
-                            # Skip trusted-signed system files (Təklif 3)
-                            if is_trusted_signed(fp):
-                                continue
+                            # PERF-3: cheap checks first, expensive I/O later
                             t = detect_item_type(fp)
                             key = (t, fp.lower())
                             if key in seen:
+                                continue
+                            # Skip trusted-signed system files (Təklif 3)
+                            if is_trusted_signed(fp):
                                 continue
                             raw_score = max(30, int(candidate.raw_score * self._extension_multiplier(fp)))
                             out.append(
@@ -1592,9 +1617,16 @@ class ProcmonAnalyzer:
                                     candidate.last_seen,
                                     candidate.processes,
                                     ["SurvivorScan"],
+                                    known_exists=True,
+                                    known_type=t,
                                 )
                             )
                             seen.add(key)
+                            root_file_count += 1
+                            if root_file_count >= _MAX_FILES_PER_ROOT:
+                                break
+                        if root_file_count >= _MAX_FILES_PER_ROOT:
+                            break
             elif candidate.type == "reg_key":
                 for reg_path in self._enumerate_registry_branch(candidate.path):
                     t = detect_item_type(reg_path)
@@ -1612,6 +1644,8 @@ class ProcmonAnalyzer:
                             candidate.last_seen,
                             candidate.processes,
                             ["RegistrySurvivorScan"],
+                            known_type=t,
+                            known_mapped=mapped,
                         )
                     )
                     seen.add(key)
