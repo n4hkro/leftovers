@@ -1,6 +1,7 @@
 """ProcmonAnalyzer – the main analysis engine for residue detection."""
 
 import bisect
+import functools
 import hashlib
 import os
 import re
@@ -8,6 +9,13 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Callable, Dict, List, Optional, Set, Tuple
+
+try:
+    import duckdb as _duckdb
+
+    _DUCKDB_AVAILABLE = True
+except ImportError:
+    _DUCKDB_AVAILABLE = False
 
 if os.name == "nt":
     import winreg
@@ -101,6 +109,7 @@ class ProcmonAnalyzer:
         self.rename_edges: List[Tuple[str, str, Optional[int], str]] = []
         self.path_facts: Dict[str, Dict[str, object]] = {}
         self.path_family_facts: Dict[str, Dict[str, object]] = {}
+        self._vendor_mirror_cache: Dict[str, List[str]] = {}
         self._index_events(cancel_cb=cancel_cb, progress_cb=progress_cb)
 
     def _index_events(
@@ -1193,6 +1202,7 @@ class ProcmonAnalyzer:
         return out
 
     @staticmethod
+    @functools.lru_cache(maxsize=4096)
     def _derive_vendor_root(path: str) -> str:
         p = normalize_path(path)
         parts = [x for x in p.split("\\") if x]
@@ -1209,11 +1219,16 @@ class ProcmonAnalyzer:
         return normalize_path(os.path.dirname(path))
 
     def _mirror_vendor_roots(self, vendor_root: str) -> List[str]:
+        cache_key = (vendor_root or "").lower()
+        if cache_key in self._vendor_mirror_cache:
+            return self._vendor_mirror_cache[cache_key]
         root = normalize_path(vendor_root)
         if not root:
+            self._vendor_mirror_cache[cache_key] = []
             return []
         parts = [x for x in root.split("\\") if x]
         if len(parts) < 3:
+            self._vendor_mirror_cache[cache_key] = [root]
             return [root]
         drive = parts[0]
         second = parts[1].lower()
@@ -1244,7 +1259,9 @@ class ProcmonAnalyzer:
                         out.add(f"{user_base}\\AppData\\Local\\{vendor}")
                 except OSError:
                     pass
-        return sorted({normalize_path(x) for x in out if x})
+        result = sorted({normalize_path(x) for x in out if x})
+        self._vendor_mirror_cache[cache_key] = result
+        return result
 
     @staticmethod
     def _walk_with_generic_reset(base_dir: str, max_depth: int = 4):
@@ -1335,7 +1352,7 @@ class ProcmonAnalyzer:
             p = (c.mapped_path or c.path)
             if p:
                 seen.add((c.type, p.lower()))
-        total_steps = max_iterations * 6
+        total_steps = max_iterations * 5
         step = 0
         for iteration in range(max_iterations):
             if cancel_cb and cancel_cb():
@@ -1353,14 +1370,8 @@ class ProcmonAnalyzer:
             if cancel_cb and cancel_cb():
                 break
 
-            _report("qonşuluq")
-            out = self._expand_neighborhood(out, seen)
-            step += 1
-            if cancel_cb and cancel_cb():
-                break
-
-            _report("mövcud fayllar")
-            out = self._expand_survivors(out, seen)
+            _report("qonşuluq + mövcud fayllar")
+            out = self._expand_fs_and_registry(out, seen)
             step += 1
             if cancel_cb and cancel_cb():
                 break
@@ -1393,6 +1404,123 @@ class ProcmonAnalyzer:
         return out
 
     def _expand_confirmed_root_clusters(self, candidates: List[ResidueCandidate]) -> List[ResidueCandidate]:
+        if _DUCKDB_AVAILABLE:
+            try:
+                return self._expand_root_clusters_duckdb(candidates)
+            except Exception:
+                pass
+        return self._expand_root_clusters_python(candidates)
+
+    # -- DuckDB-accelerated path ------------------------------------------------
+
+    def _expand_root_clusters_duckdb(self, candidates: List[ResidueCandidate]) -> List[ResidueCandidate]:
+        """Root cluster expansion powered by DuckDB.
+
+        Uses a recursive CTE to discover all candidates transitively related
+        to high-confidence roots (raw_score >= 80) through shared family IDs,
+        then batch-boosts their scores.  Mirror expansion remains in Python
+        because it requires live filesystem checks.
+        """
+        out = list(candidates)
+        n = len(out)
+        if n == 0:
+            return out
+
+        by_path: Dict[str, ResidueCandidate] = {
+            (c.mapped_path or c.path).lower(): c for c in out if (c.mapped_path or c.path)
+        }
+
+        # Prepare columnar data for DuckDB bulk load
+        idx_arr: List[int] = []
+        pkey_arr: List[str] = []
+        score_arr: List[int] = []
+        vfid_arr: List[str] = []
+        sbid_arr: List[str] = []
+        rfid_arr: List[str] = []
+        icid_arr: List[str] = []
+        for i, c in enumerate(out):
+            idx_arr.append(i)
+            pkey_arr.append((c.mapped_path or c.path or "").lower())
+            score_arr.append(c.raw_score)
+            vfid_arr.append(c.vendor_family_id or "")
+            sbid_arr.append(c.service_branch_id or "")
+            rfid_arr.append(c.rename_family_id or "")
+            icid_arr.append(c.installer_cluster_id or "")
+
+        con = _duckdb.connect()
+        try:
+            con.execute(
+                """
+                CREATE TABLE cands AS
+                SELECT
+                    unnest($1::INT[])     AS idx,
+                    unnest($2::VARCHAR[]) AS pkey,
+                    unnest($3::INT[])     AS raw_score,
+                    unnest($4::VARCHAR[]) AS vfid,
+                    unnest($5::VARCHAR[]) AS sbid,
+                    unnest($6::VARCHAR[]) AS rfid,
+                    unnest($7::VARCHAR[]) AS icid
+                """,
+                [idx_arr, pkey_arr, score_arr, vfid_arr, sbid_arr, rfid_arr, icid_arr],
+            )
+
+            # Recursive CTE: discover all root keys (including candidates that
+            # become roots after receiving the +20 boost, i.e. original score
+            # between 60 and 69 inclusive).
+            _FAMILY_JOIN = """
+                (c.vfid != '' AND c.vfid = r.vfid)
+                OR (c.sbid != '' AND c.sbid = r.sbid)
+                OR (c.rfid != '' AND c.rfid = r.rfid)
+                OR (c.icid != '' AND c.icid = r.icid)
+            """
+            boost_indices: Set[int] = {
+                row[0]
+                for row in con.execute(
+                    f"""
+                    WITH RECURSIVE root_keys AS (
+                        SELECT DISTINCT pkey, vfid, sbid, rfid, icid
+                        FROM cands
+                        WHERE raw_score >= 80
+                      UNION
+                        SELECT DISTINCT c.pkey, c.vfid, c.sbid, c.rfid, c.icid
+                        FROM cands c
+                        JOIN root_keys r
+                          ON ({_FAMILY_JOIN})
+                        WHERE c.raw_score >= 60 AND c.raw_score < 70
+                          AND c.pkey != r.pkey
+                    )
+                    SELECT DISTINCT c.idx
+                    FROM cands c
+                    JOIN root_keys r
+                      ON ({_FAMILY_JOIN})
+                    WHERE c.raw_score < 70
+                      AND c.pkey != r.pkey
+                    """
+                ).fetchall()
+            }
+        finally:
+            con.close()
+
+        # Apply boosts to the Python objects
+        for idx in boost_indices:
+            cand = out[idx]
+            cand.raw_score = min(100, cand.raw_score + 20)
+            cand.score = max(0, min(cand.raw_score, 100))
+            cand.reasons = self._unique_compact(
+                cand.reasons + ["confirmed root cluster flood-fill"]
+            )
+            cand.status = self._status_from_score(
+                cand.raw_score, cand.exists_now, cand.subtree_class
+            )
+
+        # Mirror expansion (requires live filesystem I/O — stays in Python)
+        self._add_mirror_candidates(out, by_path)
+        return out
+
+    # -- Pure-Python fallback ---------------------------------------------------
+
+    def _expand_root_clusters_python(self, candidates: List[ResidueCandidate]) -> List[ResidueCandidate]:
+        """Original reverse-index + BFS root cluster expansion (Python only)."""
         out = list(candidates)
         by_path = {(c.mapped_path or c.path).lower(): c for c in out if (c.mapped_path or c.path)}
 
@@ -1472,7 +1600,42 @@ class ProcmonAnalyzer:
                 queue.append(new_candidate)
         return out
 
-    def _expand_neighborhood(self, candidates: List[ResidueCandidate], shared_seen: Optional[Set[tuple]] = None) -> List[ResidueCandidate]:
+    # -- Shared mirror expansion helper -----------------------------------------
+
+    def _add_mirror_candidates(
+        self,
+        out: List[ResidueCandidate],
+        by_path: Dict[str, ResidueCandidate],
+    ) -> None:
+        """Append mirror-path candidates for every confirmed root (score >= 80).
+
+        Used by both the DuckDB and Python cluster expansion paths.
+        """
+        for root in [c for c in out if c.raw_score >= 80]:
+            vendor_root = self._derive_vendor_root(root.mapped_path or root.path)
+            for mirror in self._mirror_vendor_roots(vendor_root):
+                m = normalize_path(mirror)
+                key = m.lower()
+                if not m or key in by_path:
+                    continue
+                if not os.path.exists(m):
+                    continue
+                new_candidate = self._build_candidate_from_path(
+                    m,
+                    55,
+                    "mirrored root from confirmed cluster",
+                    root.first_seen,
+                    root.last_seen,
+                    root.processes,
+                    ["ConfirmedRootMirror"],
+                )
+                out.append(new_candidate)
+                by_path[key] = new_candidate
+
+    def _expand_fs_and_registry(self, candidates: List[ResidueCandidate], shared_seen: Optional[Set[tuple]] = None) -> List[ResidueCandidate]:
+        """Unified filesystem + registry expansion.  Merges the former
+        ``_expand_neighborhood`` and ``_expand_survivors`` into a single pass
+        so that each directory is walked only once instead of twice."""
         out = list(candidates)
         seen = shared_seen if shared_seen is not None else {(c.type, (c.mapped_path or c.path).lower()) for c in out if (c.mapped_path or c.path)}
 
@@ -1484,7 +1647,9 @@ class ProcmonAnalyzer:
         reg_event_pairs.sort(key=lambda x: x[0])
         reg_event_keys = [p for p, _ in reg_event_pairs]
 
-        # PERF-2: track walked scan roots to avoid redundant directory traversals
+        # Shared walked_roots across the entire method – each directory is only
+        # walked once even though we handle both "neighborhood" and "survivor"
+        # logic in the same loop.
         walked_roots: Set[str] = set()
 
         _MAX_FILES_PER_ROOT = 2000
@@ -1494,6 +1659,8 @@ class ProcmonAnalyzer:
                 continue
             if candidate.exists_now is not True:
                 continue
+
+            # ── Registry: binary-search neighbourhood + branch enumeration ──
             if candidate.type == "reg_key":
                 parent = normalize_path(os.path.dirname(candidate.path))
                 if parent:
@@ -1523,7 +1690,31 @@ class ProcmonAnalyzer:
                         )
                         out.append(new_item)
                         seen.add(key)
+                # Enumerate live registry branch (survivor logic)
+                for reg_path in self._enumerate_registry_branch(candidate.path):
+                    t = detect_item_type(reg_path)
+                    mapped = map_sandbox_user_path(reg_path)
+                    key = (t, mapped.lower())
+                    if key in seen:
+                        continue
+                    raw_score = max(30, int(candidate.raw_score * 0.5))
+                    out.append(
+                        self._build_candidate_from_path(
+                            reg_path,
+                            raw_score,
+                            f"live survivor expansion: {candidate.path}",
+                            candidate.first_seen,
+                            candidate.last_seen,
+                            candidate.processes,
+                            ["RegistrySurvivorScan"],
+                            known_type=t,
+                            known_mapped=mapped,
+                        )
+                    )
+                    seen.add(key)
                 continue
+
+            # ── Filesystem types: walk directories once ──
             if candidate.type not in {"dir", "file", "config", "database", "cache", "log", "binary"}:
                 continue
             root_dir = candidate.mapped_path if candidate.type == "dir" else os.path.dirname(candidate.mapped_path)
@@ -1532,7 +1723,6 @@ class ProcmonAnalyzer:
             vendor_root = self._derive_vendor_root(root_dir)
             scan_roots = self._mirror_vendor_roots(vendor_root) if vendor_root else [root_dir]
             for scan_root in scan_roots:
-                # PERF-2: skip already-walked roots
                 sr_key = scan_root.lower()
                 if sr_key in walked_roots:
                     continue
@@ -1571,84 +1761,6 @@ class ProcmonAnalyzer:
                             break
                     if root_file_count >= _MAX_FILES_PER_ROOT:
                         break
-        return out
-
-    def _expand_survivors(self, candidates: List[ResidueCandidate], shared_seen: Optional[Set[tuple]] = None) -> List[ResidueCandidate]:
-        out = list(candidates)
-        seen = shared_seen if shared_seen is not None else {(c.type, (c.mapped_path or c.path).lower()) for c in out if (c.mapped_path or c.path)}
-        # PERF-2: track walked scan roots to avoid redundant directory traversals
-        walked_roots: Set[str] = set()
-        _MAX_FILES_PER_ROOT = 2000
-        for candidate in list(candidates):
-            if candidate.exists_now is not True or candidate.raw_score < 55:
-                continue
-            if candidate.type in {"dir", "file", "config", "database", "cache", "log", "binary"}:
-                base_dir = candidate.mapped_path if candidate.type == "dir" else os.path.dirname(candidate.mapped_path)
-                if not base_dir:
-                    continue
-                vendor_root = self._derive_vendor_root(base_dir)
-                scan_roots = self._mirror_vendor_roots(vendor_root) if vendor_root else [base_dir]
-                for scan_root in scan_roots:
-                    sr_key = scan_root.lower()
-                    if sr_key in walked_roots:
-                        continue
-                    walked_roots.add(sr_key)
-                    if not os.path.isdir(scan_root):
-                        continue
-                    root_file_count = 0
-                    for root, dirs, files in self._walk_with_generic_reset(scan_root, max_depth=4):
-                        for fname in files:
-                            fp = normalize_path(os.path.join(root, fname))
-                            # PERF-3: cheap checks first, expensive I/O later
-                            t = detect_item_type(fp)
-                            key = (t, fp.lower())
-                            if key in seen:
-                                continue
-                            # Skip trusted-signed system files (Təklif 3)
-                            if is_trusted_signed(fp):
-                                continue
-                            raw_score = max(30, int(candidate.raw_score * self._extension_multiplier(fp)))
-                            out.append(
-                                self._build_candidate_from_path(
-                                    fp,
-                                    raw_score,
-                                    f"live survivor expansion: {scan_root}",
-                                    candidate.first_seen,
-                                    candidate.last_seen,
-                                    candidate.processes,
-                                    ["SurvivorScan"],
-                                    known_exists=True,
-                                    known_type=t,
-                                )
-                            )
-                            seen.add(key)
-                            root_file_count += 1
-                            if root_file_count >= _MAX_FILES_PER_ROOT:
-                                break
-                        if root_file_count >= _MAX_FILES_PER_ROOT:
-                            break
-            elif candidate.type == "reg_key":
-                for reg_path in self._enumerate_registry_branch(candidate.path):
-                    t = detect_item_type(reg_path)
-                    mapped = map_sandbox_user_path(reg_path)
-                    key = (t, mapped.lower())
-                    if key in seen:
-                        continue
-                    raw_score = max(30, int(candidate.raw_score * 0.5))
-                    out.append(
-                        self._build_candidate_from_path(
-                            reg_path,
-                            raw_score,
-                            f"live survivor expansion: {candidate.path}",
-                            candidate.first_seen,
-                            candidate.last_seen,
-                            candidate.processes,
-                            ["RegistrySurvivorScan"],
-                            known_type=t,
-                            known_mapped=mapped,
-                        )
-                    )
-                    seen.add(key)
         return out
 
     def _expand_confirmed_registry_branches(self, candidates: List[ResidueCandidate], shared_seen: Optional[Set[tuple]] = None) -> List[ResidueCandidate]:
