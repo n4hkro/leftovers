@@ -1265,7 +1265,8 @@ class ProcmonAnalyzer:
 
             if len(out) == before:
                 break
-            # Rebuild seen after parent-directory step (uses different key scheme).
+            # Rebuild seen: _add_parent_directory_candidates manages its own
+            # dedup set, so new entries it added are not yet in our shared seen.
             seen = set()
             for c in out:
                 p = (c.mapped_path or c.path)
@@ -1303,23 +1304,19 @@ class ProcmonAnalyzer:
             visited.add(root_key)
 
             # Collect related candidates via reverse-index lookup (O(k) not O(n))
-            related: Set[int] = set()
+            related_cands: List[ResidueCandidate] = []
             if root.vendor_family_id:
-                for c in by_vendor.get(root.vendor_family_id, ()):
-                    related.add(id(c))
+                related_cands.extend(by_vendor.get(root.vendor_family_id, ()))
             if root.service_branch_id:
-                for c in by_service.get(root.service_branch_id, ()):
-                    related.add(id(c))
+                related_cands.extend(by_service.get(root.service_branch_id, ()))
             if root.rename_family_id:
-                for c in by_rename.get(root.rename_family_id, ()):
-                    related.add(id(c))
+                related_cands.extend(by_rename.get(root.rename_family_id, ()))
             if root.installer_cluster_id:
-                for c in by_cluster.get(root.installer_cluster_id, ()):
-                    related.add(id(c))
-            root_id = id(root)
-            related.discard(root_id)
+                related_cands.extend(by_cluster.get(root.installer_cluster_id, ()))
 
-            for cand in (c for c in out if id(c) in related):
+            for cand in related_cands:
+                if cand is root:
+                    continue
                 if cand.raw_score < 70:
                     cand.raw_score = min(100, cand.raw_score + 20)
                     cand.score = max(0, min(cand.raw_score, 100))
