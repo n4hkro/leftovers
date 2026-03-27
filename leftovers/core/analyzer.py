@@ -1738,9 +1738,6 @@ class ProcmonAnalyzer:
                         key = (t, fp.lower())
                         if key in seen:
                             continue
-                        # Skip trusted-signed system files (Təklif 3)
-                        if is_trusted_signed(fp):
-                            continue
                         mult = self._extension_multiplier(fp)
                         raw_score = max(30, int(candidate.raw_score * mult))
                         new_item = self._build_candidate_from_path(
@@ -2192,17 +2189,14 @@ class ProcmonAnalyzer:
                 meta_results[path] = (trusted, info)
 
         # Phase 2: Apply results (single-threaded, mutates candidates)
+        trusted_candidates: List[ResidueCandidate] = []
         for candidate in eligible:
             trusted, info = meta_results.get(candidate.mapped_path, (False, None))
 
             if trusted:
-                candidate.status = "ignore"
-                candidate.raw_score = max(0, candidate.raw_score - 50)
-                candidate.score = max(0, min(candidate.raw_score, 100))
-                candidate.reasons = self._unique_compact(
-                    candidate.reasons + ["PROTECTED: signed by trusted publisher"]
-                )
-                continue  # Never touch signed system files
+                # Collect trusted-signed system files for removal
+                trusted_candidates.append(candidate)
+                continue
 
             if not info:
                 continue
@@ -2214,6 +2208,12 @@ class ProcmonAnalyzer:
                 candidate.raw_score += 25
                 candidate.score = max(0, min(candidate.raw_score, 100))
                 candidate.status = self._status_from_score(candidate.raw_score, candidate.exists_now, candidate.subtree_class)
+
+        # Purge all trusted-signed candidates from the shared list.
+        # trusted_candidates keeps references alive so id() comparisons are safe.
+        if trusted_candidates:
+            remove_ids = {id(c) for c in trusted_candidates}
+            candidates[:] = [c for c in candidates if id(c) not in remove_ids]
 
     def _assign_installer_clusters(self, candidates: List[ResidueCandidate]) -> None:
         for candidate in candidates:
