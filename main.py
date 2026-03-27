@@ -1483,6 +1483,14 @@ class ProcmonAnalyzer:
         if not root_terms:
             return []
 
+        # Sub-phase allocation within analyze_residue (progress_cb 0-100%):
+        #   0-7   : term expansion
+        #   7-15  : provenance index building
+        #   15-16 : related path identification
+        #   16-40 : event filtering
+        #   40-42 : GUID expansion
+        #   42-80 : group analysis
+        #   80-99 : post-processing enrichment
         if progress_cb:
             progress_cb(1, "Terminlər genişləndirilir...")
 
