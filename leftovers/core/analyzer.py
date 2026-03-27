@@ -1365,7 +1365,7 @@ class ProcmonAnalyzer:
             For every confirmed residue (score ≥ 55) that still exists on
             disk, the parent directory is walked (up to depth 4) and
             neighbouring registry keys are discovered via binary-search.
-            New items inherit ~50 % of the parent's score.
+            New items inherit ~50% of the parent's score.
             See :meth:`_expand_fs_and_registry`.
 
         **Addım 3 – Registr budaq taraması** (*Registry branch sweep*)
@@ -1855,7 +1855,7 @@ class ProcmonAnalyzer:
         run_entry, clsid, typelib, context_menu, shell_extension,
         protocol_handler) bütün alt budaqları sadalanır.  Tapılan hər yeni
         alt açar və ya dəyər nəticə siyahısına əlavə olunur; xalı valideyn
-        namizədin xalının ~55 %-i olur (minimum 35).
+        namizədin xalının ~55%-i olur (minimum 35).
         """
         out = list(candidates)
         seen = shared_seen if shared_seen is not None else {(c.type, (c.mapped_path or c.path).lower()) for c in out if (c.mapped_path or c.path)}
@@ -1905,7 +1905,7 @@ class ProcmonAnalyzer:
         * **Registr tipləri** (reg_key, service, run_entry, clsid və s.):
           eyni ana açar altındakı qardaş registr giriş­ləri.
 
-        Yeni namizədlər valideyn xalının ~50 %-i ilə əlavə olunur
+        Yeni namizədlər valideyn xalının ~50%-i ilə əlavə olunur
         (minimum 30).
         """
         out = list(candidates)
