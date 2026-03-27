@@ -915,7 +915,11 @@ class ProcmonAnalyzer:
 
         if progress_cb:
             progress_cb(86, "Təsdiqlənmiş köklərdən genişlənmə...")
-        results = self._flood_fill_from_confirmed_roots(results, created_dirs_by_chain)
+        results = self._flood_fill_from_confirmed_roots(
+            results, created_dirs_by_chain,
+            progress_cb=progress_cb,
+            cancel_cb=cancel_cb,
+        )
 
         if progress_cb:
             progress_cb(90, "Fayl metadata-sı yoxlanılır...")
@@ -1203,23 +1207,92 @@ class ProcmonAnalyzer:
         candidates: List[ResidueCandidate],
         created_dirs_by_chain: Set[str],
         max_iterations: int = 3,
+        progress_cb: Optional[Callable[[int, str], None]] = None,
+        cancel_cb: Optional[Callable[[], bool]] = None,
     ) -> List[ResidueCandidate]:
         out = list(candidates)
-        for _ in range(max_iterations):
+        # Build a shared seen set once; expansion methods maintain it incrementally.
+        seen: Set[tuple] = set()
+        for c in out:
+            p = (c.mapped_path or c.path)
+            if p:
+                seen.add((c.type, p.lower()))
+        total_steps = max_iterations * 6
+        step = 0
+        for iteration in range(max_iterations):
+            if cancel_cb and cancel_cb():
+                break
             before = len(out)
+
+            def _report(label: str) -> None:
+                if progress_cb:
+                    pct = 86 + (step * 4) // total_steps
+                    progress_cb(pct, f"Genişlənmə ({iteration + 1}/{max_iterations}): {label}")
+
+            _report("kök klasterlər")
             out = self._expand_confirmed_root_clusters(out)
-            out = self._expand_neighborhood(out)
-            out = self._expand_survivors(out)
-            out = self._expand_confirmed_registry_branches(out)
-            out = self._expand_siblings(out)
+            step += 1
+            if cancel_cb and cancel_cb():
+                break
+
+            _report("qonşuluq")
+            out = self._expand_neighborhood(out, seen)
+            step += 1
+            if cancel_cb and cancel_cb():
+                break
+
+            _report("mövcud fayllar")
+            out = self._expand_survivors(out, seen)
+            step += 1
+            if cancel_cb and cancel_cb():
+                break
+
+            _report("registr budaqları")
+            out = self._expand_confirmed_registry_branches(out, seen)
+            step += 1
+            if cancel_cb and cancel_cb():
+                break
+
+            _report("qardaş fayllar")
+            out = self._expand_siblings(out, seen)
+            step += 1
+            if cancel_cb and cancel_cb():
+                break
+
+            _report("ana qovluqlar")
             out = self._add_parent_directory_candidates(out, created_dirs_by_chain)
+            step += 1
+
             if len(out) == before:
                 break
+            # Rebuild seen after parent-directory step (uses different key scheme).
+            seen = set()
+            for c in out:
+                p = (c.mapped_path or c.path)
+                if p:
+                    seen.add((c.type, p.lower()))
         return out
 
     def _expand_confirmed_root_clusters(self, candidates: List[ResidueCandidate]) -> List[ResidueCandidate]:
         out = list(candidates)
         by_path = {(c.mapped_path or c.path).lower(): c for c in out if (c.mapped_path or c.path)}
+
+        # Build reverse-index maps so we can find related candidates in O(1)
+        # instead of scanning all candidates for every root (was O(n²)).
+        by_vendor: Dict[str, List[ResidueCandidate]] = defaultdict(list)
+        by_service: Dict[str, List[ResidueCandidate]] = defaultdict(list)
+        by_rename: Dict[str, List[ResidueCandidate]] = defaultdict(list)
+        by_cluster: Dict[str, List[ResidueCandidate]] = defaultdict(list)
+        for cand in out:
+            if cand.vendor_family_id:
+                by_vendor[cand.vendor_family_id].append(cand)
+            if cand.service_branch_id:
+                by_service[cand.service_branch_id].append(cand)
+            if cand.rename_family_id:
+                by_rename[cand.rename_family_id].append(cand)
+            if cand.installer_cluster_id:
+                by_cluster[cand.installer_cluster_id].append(cand)
+
         queue = deque([c for c in out if c.raw_score >= 80])
         visited: Set[str] = set()
         while queue:
@@ -1228,25 +1301,31 @@ class ProcmonAnalyzer:
             if root_key in visited:
                 continue
             visited.add(root_key)
-            for cand in list(out):
-                if cand is root:
-                    continue
-                related = False
-                if root.vendor_family_id and cand.vendor_family_id == root.vendor_family_id:
-                    related = True
-                if root.service_branch_id and cand.service_branch_id == root.service_branch_id:
-                    related = True
-                if root.rename_family_id and cand.rename_family_id == root.rename_family_id:
-                    related = True
-                if root.installer_cluster_id and cand.installer_cluster_id == root.installer_cluster_id:
-                    related = True
-                if not related:
-                    continue
+
+            # Collect related candidates via reverse-index lookup (O(k) not O(n))
+            related: Set[int] = set()
+            if root.vendor_family_id:
+                for c in by_vendor.get(root.vendor_family_id, ()):
+                    related.add(id(c))
+            if root.service_branch_id:
+                for c in by_service.get(root.service_branch_id, ()):
+                    related.add(id(c))
+            if root.rename_family_id:
+                for c in by_rename.get(root.rename_family_id, ()):
+                    related.add(id(c))
+            if root.installer_cluster_id:
+                for c in by_cluster.get(root.installer_cluster_id, ()):
+                    related.add(id(c))
+            root_id = id(root)
+            related.discard(root_id)
+
+            for cand in (c for c in out if id(c) in related):
                 if cand.raw_score < 70:
                     cand.raw_score = min(100, cand.raw_score + 20)
                     cand.score = max(0, min(cand.raw_score, 100))
                     cand.reasons = self._unique_compact(cand.reasons + ["confirmed root cluster flood-fill"])
                     cand.status = self._status_from_score(cand.raw_score, cand.exists_now, cand.subtree_class)
+
             vendor_root = self._derive_vendor_root(root.mapped_path or root.path)
             for mirror in self._mirror_vendor_roots(vendor_root):
                 m = normalize_path(mirror)
@@ -1266,12 +1345,21 @@ class ProcmonAnalyzer:
                 )
                 out.append(new_candidate)
                 by_path[key] = new_candidate
+                # Register new candidate in reverse indexes
+                if new_candidate.vendor_family_id:
+                    by_vendor[new_candidate.vendor_family_id].append(new_candidate)
+                if new_candidate.service_branch_id:
+                    by_service[new_candidate.service_branch_id].append(new_candidate)
+                if new_candidate.rename_family_id:
+                    by_rename[new_candidate.rename_family_id].append(new_candidate)
+                if new_candidate.installer_cluster_id:
+                    by_cluster[new_candidate.installer_cluster_id].append(new_candidate)
                 queue.append(new_candidate)
         return out
 
-    def _expand_neighborhood(self, candidates: List[ResidueCandidate]) -> List[ResidueCandidate]:
+    def _expand_neighborhood(self, candidates: List[ResidueCandidate], shared_seen: Optional[Set[tuple]] = None) -> List[ResidueCandidate]:
         out = list(candidates)
-        seen = {(c.type, (c.mapped_path or c.path).lower()) for c in out if (c.mapped_path or c.path)}
+        seen = shared_seen if shared_seen is not None else {(c.type, (c.mapped_path or c.path).lower()) for c in out if (c.mapped_path or c.path)}
 
         # PERF-1 fix: build a prefix-based index of events by registry path prefix
         # to avoid full O(n) scan for every reg_key candidate
@@ -1359,9 +1447,9 @@ class ProcmonAnalyzer:
                         seen.add(key)
         return out
 
-    def _expand_survivors(self, candidates: List[ResidueCandidate]) -> List[ResidueCandidate]:
+    def _expand_survivors(self, candidates: List[ResidueCandidate], shared_seen: Optional[Set[tuple]] = None) -> List[ResidueCandidate]:
         out = list(candidates)
-        seen = {(c.type, (c.mapped_path or c.path).lower()) for c in out if (c.mapped_path or c.path)}
+        seen = shared_seen if shared_seen is not None else {(c.type, (c.mapped_path or c.path).lower()) for c in out if (c.mapped_path or c.path)}
         for candidate in list(candidates):
             if candidate.exists_now is not True or candidate.raw_score < 55:
                 continue
@@ -1419,9 +1507,9 @@ class ProcmonAnalyzer:
                     seen.add(key)
         return out
 
-    def _expand_confirmed_registry_branches(self, candidates: List[ResidueCandidate]) -> List[ResidueCandidate]:
+    def _expand_confirmed_registry_branches(self, candidates: List[ResidueCandidate], shared_seen: Optional[Set[tuple]] = None) -> List[ResidueCandidate]:
         out = list(candidates)
-        seen = {(c.type, (c.mapped_path or c.path).lower()) for c in out if (c.mapped_path or c.path)}
+        seen = shared_seen if shared_seen is not None else {(c.type, (c.mapped_path or c.path).lower()) for c in out if (c.mapped_path or c.path)}
         for candidate in list(candidates):
             if candidate.raw_score < 50:
                 continue
@@ -1456,9 +1544,9 @@ class ProcmonAnalyzer:
                 seen.add(key)
         return out
 
-    def _expand_siblings(self, candidates: List[ResidueCandidate]) -> List[ResidueCandidate]:
+    def _expand_siblings(self, candidates: List[ResidueCandidate], shared_seen: Optional[Set[tuple]] = None) -> List[ResidueCandidate]:
         out = list(candidates)
-        seen = {(c.type, (c.mapped_path or c.path).lower()) for c in out if (c.mapped_path or c.path)}
+        seen = shared_seen if shared_seen is not None else {(c.type, (c.mapped_path or c.path).lower()) for c in out if (c.mapped_path or c.path)}
         for candidate in list(candidates):
             if candidate.raw_score < 40:
                 continue
